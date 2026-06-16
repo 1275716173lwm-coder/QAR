@@ -20,7 +20,7 @@ from qar_common import numeric_array, numeric_columns, read_qar_csv
 
 ROOT_DIR = Path(__file__).resolve().parent
 PICS_DIR = ROOT_DIR / "pics"
-REPORT_BASENAME = "QAR批量分析报告"
+REPORT_BASENAME = "QAR分析"
 AIRCRAFT_ORDER = ("CFM", "LEAP", "PW")
 AIRCRAFT_DISPLAY = {
     "CFM": "CFM",
@@ -275,30 +275,630 @@ def collect_takeoff_points(task):
     return np.concatenate(x_parts), np.concatenate(y_parts)
 
 
-def takeoff_analysis_text(task):
-    x_values, y_values = collect_takeoff_points(task)
-    if not len(x_values) or not len(y_values):
-        return f"{task.aircraft}机型起飞50ft以下杆量无法自动计算。"
+def finite_values(values):
+    values = np.asarray(values, dtype=float).reshape(-1)
+    return values[np.isfinite(values)]
 
-    highest = float(np.nanmax(y_values))
-    lowest = float(np.nanmin(y_values))
-    lateral = float(np.nanmax(np.abs(x_values)))
-    if lowest >= 0:
+
+def has_columns(dataframe, columns):
+    return all(column in dataframe.columns for column in columns)
+
+
+def range_indexes_by_height(dataframe, height_columns, lower, upper):
+    max_height = numeric_columns(dataframe, height_columns).max(axis=1)
+    indexes = []
+    for index in reversed(max_height.index):
+        value = max_height.loc[index]
+        if lower < value < upper:
+            indexes.append(index)
+        elif value > upper:
+            break
+    return indexes
+
+
+def control_metrics(x_values, y_values, wind_values=None):
+    x_values = finite_values(x_values)
+    y_values = finite_values(y_values)
+    if not len(x_values) or not len(y_values):
+        return None
+
+    below_axis = y_values[y_values < 0]
+    wind_values = finite_values(wind_values if wind_values is not None else [])
+    return {
+        "pull": max(float(np.nanmax(y_values)), 0.0),
+        "steady": abs(float(np.nanmin(below_axis))) if len(below_axis) else 0.0,
+        "lateral": float(np.nanmax(np.abs(x_values))),
+        "wind": float(np.nanmax(wind_values)) if len(wind_values) else None,
+    }
+
+
+def merge_control_metrics(metric_parts, require_wind=False):
+    metric_parts = [metrics for metrics in metric_parts if metrics]
+    if not metric_parts:
+        return None
+
+    wind_values = [metrics["wind"] for metrics in metric_parts if metrics.get("wind") is not None]
+    if require_wind and not wind_values:
+        return None
+
+    return {
+        "pull": max(metrics["pull"] for metrics in metric_parts),
+        "steady": max(metrics["steady"] for metrics in metric_parts),
+        "lateral": max(metrics["lateral"] for metrics in metric_parts),
+        "wind": max(wind_values) if wind_values else None,
+    }
+
+
+def format_number(value):
+    value = float(value)
+    if value >= 0:
+        return str(int(np.floor(value + 0.5)))
+    return str(int(np.ceil(value - 0.5)))
+
+
+def format_value_range(values, unit=""):
+    values = finite_values(values)
+    if not len(values):
+        return None
+
+    low = float(np.nanmin(values))
+    high = float(np.nanmax(values))
+    if abs(high - low) < 0.05:
+        return f"{format_number(low)}{unit}"
+    return f"{format_number(low)}~{format_number(high)}{unit}"
+
+
+ALERT_THRESHOLD = 10
+
+
+def analysis_part(text, alert=False):
+    return {"text": text, "alert": bool(alert)}
+
+
+def metric_analysis_part(prefix, value, suffix):
+    displayed_value = format_number(value)
+    return analysis_part(f"{prefix}{displayed_value}{suffix}", int(displayed_value) > ALERT_THRESHOLD)
+
+
+def strip_trailing_period(parts):
+    copied = [dict(part) for part in parts if part.get("text")]
+    if copied and copied[-1]["text"].endswith("。"):
+        copied[-1]["text"] = copied[-1]["text"][:-1]
+    return [part for part in copied if part["text"]]
+
+
+def join_analysis_parts(parts_iter):
+    joined = []
+    has_content = False
+    for parts in parts_iter:
+        cleaned = strip_trailing_period(parts)
+        if not cleaned:
+            continue
+        if has_content:
+            joined.append(analysis_part("；"))
+        joined.extend(cleaned)
+        has_content = True
+    if not has_content:
+        return [analysis_part("该项数据无法自动计算。")]
+    joined.append(analysis_part("。"))
+    return joined
+
+
+def takeoff_analysis_parts(task):
+    x_values, y_values = collect_takeoff_points(task)
+    metrics = control_metrics(x_values, y_values)
+    if metrics is None:
+        return [analysis_part(f"{task.aircraft}机型起飞50ft以下杆量无法自动计算。")]
+
+    if metrics["steady"] <= 0:
         status = "起飞杆量正常"
-        steady_text = ""
-    elif abs(lowest) <= 5:
+        steady_parts = []
+    elif metrics["steady"] <= 5:
         status = "起飞有少量稳杆"
-        steady_text = f"，稳杆量最大约{abs(lowest):.1f}个单位"
+        steady_parts = [
+            analysis_part("，"),
+            metric_analysis_part("稳杆量最大约", metrics["steady"], "个单位"),
+        ]
     else:
         status = "起飞有稳杆"
-        steady_text = f"，稳杆量最大约{abs(lowest):.1f}个单位"
+        steady_parts = [
+            analysis_part("，"),
+            metric_analysis_part("稳杆量最大约", metrics["steady"], "个单位"),
+        ]
 
-    pull_value = highest if highest > 0 else 0.0
-    return (
-        f"{task.aircraft}机型{status}，"
-        f"带杆量最大约{pull_value:.1f}个单位"
-        f"{steady_text}，横侧杆量{lateral:.1f}个单位。"
-    )
+    return [
+        analysis_part(f"{task.aircraft}机型{status}，"),
+        metric_analysis_part("带杆量最大约", metrics["pull"], "个单位"),
+        *steady_parts,
+        analysis_part("，"),
+        metric_analysis_part("横侧杆量", metrics["lateral"], "个单位"),
+        analysis_part("。"),
+    ]
+
+
+def takeoff_analysis_text(task):
+    return "".join(part["text"] for part in takeoff_analysis_parts(task))
+
+
+def control_metrics_alert(metrics, include_wind=False):
+    if not metrics:
+        return False
+    if any(metrics[key] > ALERT_THRESHOLD for key in ("pull", "steady", "lateral")):
+        return True
+    return bool(include_wind and metrics.get("wind") is not None and metrics["wind"] > ALERT_THRESHOLD)
+
+
+def takeoff_analysis_alert(task):
+    x_values, y_values = collect_takeoff_points(task)
+    return control_metrics_alert(control_metrics(x_values, y_values))
+
+
+def _collect_cfm_liftoff_values(path):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    aircraft_state_cols = [
+        "AIRCRAFT ON GROUND (CFM)_592",
+        "AIRCRAFT ON GROUND (CFM)_599",
+    ]
+    gear_cols = [
+        "LANDING GEAR NOSE_1",
+        "LANDING GEAR NOSE_2",
+        "LANDING GEAR NOSE_3",
+        "LANDING GEAR NOSE_4",
+    ]
+    pitch_cols = [
+        "Pitch attitude CA_1",
+        "Pitch attitude CA_2",
+        "Pitch attitude CA_3",
+        "Pitch attitude CA_4",
+        "Pitch attitude CA_5",
+        "Pitch attitude CA_6",
+        "Pitch attitude CA_7",
+    ]
+    height_cols = [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+        "RADIO HEIGHT (R/A1) SYS. 2_1",
+        "RADIO HEIGHT (R/A1) SYS. 2_2",
+        "RADIO HEIGHT (R/A1) SYS. 2_3",
+        "RADIO HEIGHT (R/A1) SYS. 2_4",
+    ]
+    required = aircraft_state_cols + gear_cols + pitch_cols + height_cols
+    if not has_columns(data, required):
+        return np.array([])
+
+    gear_air_counts = (data[gear_cols] == "AIR").sum(axis=1)
+    gear_indexes = []
+    for index, count in gear_air_counts.items():
+        if count > 0:
+            for offset in range(4):
+                candidate = index - offset
+                if candidate in data.index:
+                    gear_indexes.append(candidate)
+
+    max_height = numeric_columns(data, height_cols).max(axis=1)
+    height_indexes = []
+    for index, value in max_height.items():
+        if value > 50:
+            break
+        height_indexes.append(index)
+
+    candidate_indexes = sorted(set(gear_indexes).intersection(height_indexes))
+    if not candidate_indexes:
+        return np.array([])
+
+    selected = data.loc[candidate_indexes]
+    liftoff_mask = (selected[aircraft_state_cols[1]] == "NO").astype(int) - (
+        selected[aircraft_state_cols[0]] == "YES"
+    ).astype(int) > 0
+    liftoff_indexes = list(liftoff_mask[liftoff_mask].index)
+    if not liftoff_indexes:
+        return np.array([])
+
+    return finite_values(numeric_array(data.loc[[liftoff_indexes[0]]], pitch_cols))
+
+
+def _collect_pw_liftoff_values(path, leap=False):
+    if leap:
+        return np.array([])
+
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    gear_cols = [
+        "NOSE LANDING GEAR COMPRESSED SYS. 1_49",
+        "NOSE LANDING GEAR COMPRESSED SYS. 1_305",
+        "NOSE LANDING GEAR COMPRESSED SYS. 1_561",
+        "NOSE LANDING GEAR COMPRESSED SYS. 1_817",
+    ]
+    pitch_cols = [
+        "PITCH ANGLE SYS. 1_43",
+        "PITCH ANGLE SYS. 1_107",
+        "PITCH ANGLE SYS. 1_171",
+        "PITCH ANGLE SYS. 1_235",
+    ]
+    height_col = "RADIO HEIGHT (R/A1) SYS. 1_4"
+    ground_cols = [
+        "GROUND FLIGHT BOOLEAN BSOL_26",
+        "GROUND FLIGHT BOOLEAN BSOL_282",
+        "GROUND FLIGHT BOOLEAN BSOL_538",
+        "GROUND FLIGHT BOOLEAN BSOL_794",
+    ]
+    required = gear_cols + pitch_cols + [height_col] + ground_cols
+    if not has_columns(data, required):
+        return np.array([])
+
+    gear_mask = (data[gear_cols] == "NOFALT").sum(axis=1) > 0
+    gear_positions = np.where(gear_mask)[0]
+    if not len(gear_positions):
+        return np.array([])
+    start = max(int(gear_positions[0]) - 3, 0)
+
+    height_values = numeric_columns(data, [height_col]).iloc[:, 0]
+    height_positions = np.where(height_values > 50)[0]
+    if not len(height_positions):
+        return np.array([])
+    end = int(height_positions[0])
+    if end < start:
+        return np.array([])
+
+    selected = data.loc[start:end]
+    liftoff_mask = (selected[ground_cols] == "NOACT").sum(axis=1) > 0
+    liftoff_indexes = list(liftoff_mask[liftoff_mask].index)
+    if not liftoff_indexes:
+        return np.array([])
+
+    return finite_values(numeric_array(data.loc[[liftoff_indexes[0]]], pitch_cols))
+
+
+def collect_liftoff_values(task):
+    if task.aircraft == "LEAP":
+        return np.array([])
+
+    collectors = {
+        "CFM": _collect_cfm_liftoff_values,
+        "PW": lambda path: _collect_pw_liftoff_values(path, leap=False),
+    }
+    values = []
+    for path in task.paths:
+        try:
+            values_part = collectors[task.aircraft](path)
+        except Exception:
+            continue
+        if len(values_part):
+            values.append(values_part)
+    if not values:
+        return np.array([])
+    return np.concatenate(values)
+
+
+def liftoff_analysis_text(task):
+    if task.aircraft == "LEAP":
+        return "LEAP机型离地姿态数据图形有误。"
+
+    values = collect_liftoff_values(task)
+    value_range = format_value_range(values, "度")
+    if value_range is None:
+        return f"{task.aircraft}机型离地姿态数据无法自动计算。"
+    return f"{task.aircraft}机型离地曲线正常，离地姿态范围{value_range}。"
+
+
+def _collect_cfm_phase_metrics(path, lower, upper):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    height_cols = [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+        "RADIO HEIGHT (R/A1) SYS. 2_1",
+        "RADIO HEIGHT (R/A1) SYS. 2_2",
+        "RADIO HEIGHT (R/A1) SYS. 2_3",
+        "RADIO HEIGHT (R/A1) SYS. 2_4",
+    ]
+    pitch_cols = [
+        "Capt Pitch Command Positi_1",
+        "Capt Pitch Command Positi_2",
+        "Capt Pitch Command Positi_3",
+        "Capt Pitch Command Positi_4",
+        "Capt Pitch Command Positi_5",
+        "Capt Pitch Command Positi_6",
+        "Capt Pitch Command Positi_7",
+        "Capt Pitch Command Positi_8",
+    ]
+    roll_cols = [
+        "Capt Roll Command Positio_1",
+        "Capt Roll Command Positio_2",
+        "Capt Roll Command Positio_3",
+        "Capt Roll Command Positio_4",
+        "Capt Roll Command Positio_5",
+        "Capt Roll Command Positio_6",
+        "Capt Roll Command Positio_7",
+        "Capt Roll Command Positio_8",
+    ]
+    wind_cols = ["Wind speed"]
+    required = height_cols + pitch_cols + roll_cols + wind_cols
+    if not has_columns(data, required):
+        return None
+
+    indexes = range_indexes_by_height(data, height_cols, lower, upper)
+    if not indexes:
+        return None
+
+    x_values = numeric_array(data.loc[indexes], roll_cols).reshape(-1)
+    y_values = -numeric_array(data.loc[indexes], pitch_cols).reshape(-1)
+    wind_values = numeric_array(data.loc[indexes], wind_cols).reshape(-1)
+    return control_metrics(x_values, y_values, wind_values)
+
+
+def _collect_pw_phase_metrics(path, lower, upper, leap=False):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    height_cols = [
+        "RADIO ALTITUDE SYS. 1_1",
+        "RADIO ALTITUDE SYS. 1_2",
+        "RADIO ALTITUDE SYS. 1_3",
+        "RADIO ALTITUDE SYS. 1_4",
+        "RADIO ALTITUDE SYS. 1_5",
+    ] if leap else [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+        "RADIO HEIGHT (R/A1) SYS. 1_5",
+    ]
+    pitch_cols = [
+        "PITCH CAPT CMD POSITION_58",
+        "PITCH CAPT CMD POSITION_186",
+        "PITCH CAPT CMD POSITION_314",
+        "PITCH CAPT CMD POSITION_442",
+        "PITCH CAPT CMD POSITION_570",
+        "PITCH CAPT CMD POSITION_698",
+        "PITCH CAPT CMD POSITION_826",
+        "PITCH CAPT CMD POSITION_954",
+    ]
+    roll_cols = [
+        "ROLL CAPT CMD POSITION_46",
+        "ROLL CAPT CMD POSITION_174",
+        "ROLL CAPT CMD POSITION_302",
+        "ROLL CAPT CMD POSITION_430",
+        "ROLL CAPT CMD POSITION_558",
+        "ROLL CAPT CMD POSITION_686",
+        "ROLL CAPT CMD POSITION_814",
+        "ROLL CAPT CMD POSITION_942",
+    ]
+    wind_col = "WIND SPEED"
+    required = height_cols + pitch_cols + roll_cols + [wind_col]
+    if not has_columns(data, required):
+        return None
+
+    indexes = range_indexes_by_height(data, height_cols, lower, upper)
+    if not indexes:
+        return None
+
+    x_values = numeric_array(data.loc[indexes], roll_cols).reshape(-1)
+    if leap:
+        x_values = -x_values
+    y_values = -numeric_array(data.loc[indexes], pitch_cols).reshape(-1)
+    wind_values = numeric_array(data.loc[indexes], [wind_col]).reshape(-1)
+    return control_metrics(x_values, y_values, wind_values)
+
+
+def collect_phase_metrics(task, lower, upper):
+    collectors = {
+        "CFM": lambda path: _collect_cfm_phase_metrics(path, lower, upper),
+        "LEAP": lambda path: _collect_pw_phase_metrics(path, lower, upper, leap=True),
+        "PW": lambda path: _collect_pw_phase_metrics(path, lower, upper, leap=False),
+    }
+    metric_parts = []
+    for path in task.paths:
+        try:
+            metrics = collectors[task.aircraft](path)
+        except Exception:
+            continue
+        if metrics:
+            metric_parts.append(metrics)
+    return merge_control_metrics(metric_parts, require_wind=True)
+
+
+def phase_analysis_parts(task, lower, upper, phase_name):
+    metrics = collect_phase_metrics(task, lower, upper)
+    if metrics is None:
+        return [analysis_part(f"{task.aircraft}机型{phase_name}数据无法自动计算。")]
+
+    return [
+        analysis_part(f"{task.aircraft}机型"),
+        metric_analysis_part("带杆量最大", metrics["pull"], "个单位"),
+        analysis_part("，"),
+        metric_analysis_part("稳杆量最大", metrics["steady"], "个单位"),
+        analysis_part("，"),
+        metric_analysis_part("横侧量最大为", metrics["lateral"], "个单位"),
+        analysis_part("，"),
+        metric_analysis_part("最大侧风", metrics["wind"], "节"),
+        analysis_part("。"),
+    ]
+
+
+def phase_analysis_text(task, lower, upper, phase_name):
+    return "".join(part["text"] for part in phase_analysis_parts(task, lower, upper, phase_name))
+
+
+def phase_analysis_alert(task, lower, upper):
+    return control_metrics_alert(collect_phase_metrics(task, lower, upper), include_wind=True)
+
+
+def _collect_cfm_throttle_values(path):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    range_height_cols = [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+        "RADIO HEIGHT (R/A1) SYS. 2_1",
+        "RADIO HEIGHT (R/A1) SYS. 2_2",
+        "RADIO HEIGHT (R/A1) SYS. 2_3",
+        "RADIO HEIGHT (R/A1) SYS. 2_4",
+    ]
+    plot_height_cols = [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+    ]
+    throttle_col = "Throttle lever angle Eng1_1"
+    required = range_height_cols + plot_height_cols + [throttle_col]
+    if not has_columns(data, required):
+        return np.array([])
+
+    indexes = range_indexes_by_height(data, range_height_cols, 0, 100)
+    if not indexes:
+        return np.array([])
+
+    sorted_indexes = sorted(indexes)
+    height_values = numeric_array(data.loc[sorted_indexes], plot_height_cols).reshape(-1)
+    throttle_values = numeric_array(data.loc[sorted_indexes], [throttle_col]).reshape(-1)
+    for index, throttle in enumerate(throttle_values):
+        if throttle < 0:
+            marker_pos = index * len(plot_height_cols)
+            if marker_pos < len(height_values):
+                return finite_values([height_values[marker_pos]])
+            break
+    return np.array([])
+
+
+def _collect_pw_throttle_values(path, leap=False):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    height_cols = [
+        "RADIO ALTITUDE SYS. 1_1",
+        "RADIO ALTITUDE SYS. 1_2",
+        "RADIO ALTITUDE SYS. 1_3",
+        "RADIO ALTITUDE SYS. 1_4",
+        "RADIO ALTITUDE SYS. 1_5",
+    ] if leap else [
+        "RADIO HEIGHT (R/A1) SYS. 1_1",
+        "RADIO HEIGHT (R/A1) SYS. 1_2",
+        "RADIO HEIGHT (R/A1) SYS. 1_3",
+        "RADIO HEIGHT (R/A1) SYS. 1_4",
+        "RADIO HEIGHT (R/A1) SYS. 1_5",
+    ]
+    throttle_col = "THRUST LEVER ANGLE POS SYS. 1" if leap else "TRA (THROTTLE RESOLVER ANGLE) SYS. 1"
+    ground_cols = [
+        "GROUND FLIGHT BOOLEAN BSOL_26",
+        "GROUND FLIGHT BOOLEAN BSOL_282",
+        "GROUND FLIGHT BOOLEAN BSOL_538",
+        "GROUND FLIGHT BOOLEAN BSOL_794",
+    ]
+    required = height_cols + [throttle_col]
+    if leap:
+        required += ground_cols
+    if not has_columns(data, required):
+        return np.array([])
+
+    if leap:
+        max_height = numeric_columns(data, height_cols).max(axis=1)
+        indexes = []
+        started = False
+        for index in reversed(max_height.index):
+            if all(data.loc[index, column] == "NOACT" for column in ground_cols):
+                started = True
+            if started and 0 < max_height.loc[index] < 50:
+                indexes.append(index)
+            elif started and max_height.loc[index] > 50:
+                break
+    else:
+        indexes = range_indexes_by_height(data, height_cols, 0, 50)
+    if not indexes:
+        return np.array([])
+
+    sorted_indexes = sorted(indexes)
+    height_matrix = numeric_array(data.loc[sorted_indexes], height_cols)
+    height_values = np.array([sorted(row, reverse=True) for row in height_matrix]).reshape(-1)
+    throttle_values = numeric_array(data.loc[sorted_indexes], [throttle_col]).reshape(-1)
+    for index, throttle in enumerate(throttle_values):
+        if throttle < 0:
+            marker_pos = index * (4 if leap else len(height_cols)) + (1 if leap else 0)
+            if marker_pos < len(height_values):
+                return finite_values([height_values[marker_pos]])
+            break
+    return np.array([])
+
+
+def collect_throttle_values(task):
+    collectors = {
+        "CFM": _collect_cfm_throttle_values,
+        "LEAP": lambda path: _collect_pw_throttle_values(path, leap=True),
+        "PW": lambda path: _collect_pw_throttle_values(path, leap=False),
+    }
+    values = []
+    for path in task.paths:
+        try:
+            values_part = collectors[task.aircraft](path)
+        except Exception:
+            continue
+        if len(values_part):
+            values.append(values_part)
+    if not values:
+        return np.array([])
+    return np.concatenate(values)
+
+
+def throttle_analysis_text(task):
+    value_range = format_value_range(collect_throttle_values(task), "ft")
+    if value_range is None:
+        return f"{task.aircraft}机型收油门高度无法自动计算。"
+    return f"{task.aircraft}机型收油门高度范围在{value_range}。"
+
+
+def text_analysis_parts(text):
+    return [analysis_part(text)]
+
+
+def join_analysis_texts(parts):
+    cleaned = [part.rstrip("。") for part in parts if part]
+    if not cleaned:
+        return "该项数据无法自动计算。"
+    return "；".join(cleaned) + "。"
+
+
+def build_analysis_entries(aircraft_tasks):
+    tasks = [aircraft_tasks[aircraft] for aircraft in AIRCRAFT_ORDER if aircraft in aircraft_tasks]
+    if not tasks:
+        return [
+            {
+                "title": "分析结果：",
+                "body_parts": [analysis_part("该人员无可写入的机型图片和分析数据。")],
+                "alert": False,
+            }
+        ]
+
+    return [
+        {
+            "title": "起飞50ft以下杆量：",
+            "body_parts": join_analysis_parts(takeoff_analysis_parts(task) for task in tasks),
+            "alert": any(takeoff_analysis_alert(task) for task in tasks),
+        },
+        {
+            "title": "离地姿态：",
+            "body_parts": join_analysis_parts(text_analysis_parts(liftoff_analysis_text(task)) for task in tasks),
+            "alert": False,
+        },
+        {
+            "title": "进近1000-100ft杆量：",
+            "body_parts": join_analysis_parts(
+                phase_analysis_parts(task, 100, 1000, "进近1000-100ft杆量") for task in tasks
+            ),
+            "alert": any(phase_analysis_alert(task, 100, 1000) for task in tasks),
+        },
+        {
+            "title": "落地100ft以下杆量：",
+            "body_parts": join_analysis_parts(
+                phase_analysis_parts(task, 0, 100, "落地100ft以下杆量") for task in tasks
+            ),
+            "alert": any(phase_analysis_alert(task, 0, 100) for task in tasks),
+        },
+        {
+            "title": "50ft以下曲线及收油门时机：",
+            "body_parts": join_analysis_parts(text_analysis_parts(throttle_analysis_text(task)) for task in tasks),
+            "alert": False,
+        },
+    ]
 
 
 def _set_run_font(run, size=None, bold=None, color=None):
@@ -359,6 +959,36 @@ def _add_paragraph(document, text="", style=None, size=11, bold=False, color=Non
     return paragraph
 
 
+def _add_analysis_bullet(document, entry):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    paragraph = document.add_paragraph(style="List Bullet")
+    ppr = paragraph._p.get_or_add_pPr()
+    existing_num_pr = ppr.find(qn("w:numPr"))
+    if existing_num_pr is not None:
+        ppr.remove(existing_num_pr)
+    num_pr = OxmlElement("w:numPr")
+    ilvl = OxmlElement("w:ilvl")
+    ilvl.set(qn("w:val"), "0")
+    num_id = OxmlElement("w:numId")
+    num_id.set(qn("w:val"), "1")
+    num_pr.append(ilvl)
+    num_pr.append(num_id)
+    ppr.append(num_pr)
+
+    title_run = paragraph.add_run(entry["title"])
+    _set_run_font(title_run, size=11, bold=True, color="2E74B5")
+    body_parts = entry.get("body_parts") or [analysis_part(entry.get("body", ""), entry.get("alert", False))]
+    for body_part in body_parts:
+        text = body_part.get("text", "")
+        if not text:
+            continue
+        body_run = paragraph.add_run(text)
+        _set_run_font(body_run, size=11, color="C00000" if body_part.get("alert") else None)
+    return paragraph
+
+
 def _add_heading(document, text, level=1):
     paragraph = document.add_heading("", level=level)
     run = paragraph.add_run(text)
@@ -410,7 +1040,6 @@ def build_report_items(successful_tasks, skipped, validation_errors, failures):
 
         counts = {aircraft: len(aircraft_tasks[aircraft].paths) if aircraft in aircraft_tasks else 0 for aircraft in AIRCRAFT_ORDER}
         total = sum(counts.values())
-        analysis_parts = []
         for aircraft in AIRCRAFT_ORDER:
             task = aircraft_tasks.get(aircraft)
             if task is None:
@@ -421,7 +1050,6 @@ def build_report_items(successful_tasks, skipped, validation_errors, failures):
                 items.append(("image", task.output_path))
             else:
                 items.append(("warning", f"未找到结果图片：{task.output_path}"))
-            analysis_parts.append(takeoff_analysis_text(task))
 
         items.append(("analysis_label", "分析："))
         items.append(
@@ -434,10 +1062,8 @@ def build_report_items(successful_tasks, skipped, validation_errors, failures):
                 ),
             )
         )
-        if analysis_parts:
-            items.append(("paragraph", "1.起飞50ft以下杆量：" + "；".join(analysis_parts)))
-        else:
-            items.append(("paragraph", "1.起飞50ft以下杆量：该人员无可写入的机型图片和分析数据。"))
+        for analysis_entry in build_analysis_entries(aircraft_tasks):
+            items.append(("analysis_bullet", analysis_entry))
 
     return items
 
@@ -479,6 +1105,8 @@ def generate_report_with_python_docx(successful_tasks, skipped, validation_error
             _add_paragraph(document, value, size=10, color="555555")
         elif item_type == "analysis_label":
             _add_paragraph(document, value, bold=True)
+        elif item_type == "analysis_bullet":
+            _add_analysis_bullet(document, value)
         else:
             _add_paragraph(document, value)
 
@@ -511,6 +1139,37 @@ def _paragraph_xml(text, style=None, bold=False, color=None, align=None):
         run_props.append(f'<w:color w:val="{color}"/>')
     rpr = f"<w:rPr>{''.join(run_props)}</w:rPr>"
     return f"<w:p>{ppr}<w:r>{rpr}<w:t>{escaped}</w:t></w:r></w:p>"
+
+
+def _run_xml(text, bold=False, color=None):
+    escaped = escape(str(text))
+    run_props = [
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/>',
+    ]
+    if bold:
+        run_props.append("<w:b/>")
+    if color:
+        run_props.append(f'<w:color w:val="{color}"/>')
+    return f"<w:r><w:rPr>{''.join(run_props)}</w:rPr><w:t>{escaped}</w:t></w:r>"
+
+
+def _analysis_bullet_xml(entry):
+    body_parts = entry.get("body_parts") or [analysis_part(entry.get("body", ""), entry.get("alert", False))]
+    body_xml = "".join(
+        _run_xml(part.get("text", ""), color="C00000" if part.get("alert") else None)
+        for part in body_parts
+        if part.get("text")
+    )
+    return (
+        "<w:p>"
+        "<w:pPr>"
+        '<w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>'
+        '<w:spacing w:after="120"/>'
+        "</w:pPr>"
+        f"{_run_xml(entry['title'], bold=True, color='2E74B5')}"
+        f"{body_xml}"
+        "</w:p>"
+    )
 
 
 def _image_xml(rel_id, image_name, cx, cy):
@@ -573,7 +1232,31 @@ def _styles_xml():
     <w:pPr><w:spacing w:before="240" w:after="120"/><w:outlineLvl w:val="1"/></w:pPr>
     <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/></w:rPr>
   </w:style>
+  <w:style w:type="paragraph" w:styleId="ListBullet">
+    <w:name w:val="List Bullet"/><w:basedOn w:val="Normal"/><w:uiPriority w:val="99"/><w:semiHidden/><w:unhideWhenUsed/>
+    <w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/><w:sz w:val="22"/></w:rPr>
+  </w:style>
 </w:styles>
+"""
+
+
+def _numbering_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:abstractNum w:abstractNumId="0">
+    <w:multiLevelType w:val="hybridMultilevel"/>
+    <w:lvl w:ilvl="0">
+      <w:start w:val="1"/>
+      <w:numFmt w:val="bullet"/>
+      <w:lvlText w:val="•"/>
+      <w:lvlJc w:val="left"/>
+      <w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr>
+      <w:rPr><w:rFonts w:ascii="Symbol" w:hAnsi="Symbol" w:hint="default"/></w:rPr>
+    </w:lvl>
+  </w:abstractNum>
+  <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+</w:numbering>
 """
 
 
@@ -802,6 +1485,8 @@ def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, fai
             body_parts.append(_paragraph_xml(value, color="555555"))
         elif item_type == "analysis_label":
             body_parts.append(_paragraph_xml(value, bold=True))
+        elif item_type == "analysis_bullet":
+            body_parts.append(_analysis_bullet_xml(value))
         else:
             body_parts.append(_paragraph_xml(value))
 
@@ -841,6 +1526,7 @@ def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, fai
     (doc_props_dir / "app.xml").write_text(_app_properties_xml(), encoding="utf-8")
     (word_dir / "document.xml").write_text(document_xml, encoding="utf-8")
     (word_dir / "styles.xml").write_text(_styles_xml(), encoding="utf-8")
+    (word_dir / "numbering.xml").write_text(_numbering_xml(), encoding="utf-8")
     (word_dir / "settings.xml").write_text(_settings_xml(), encoding="utf-8")
     (word_dir / "webSettings.xml").write_text(_web_settings_xml(), encoding="utf-8")
     (word_dir / "fontTable.xml").write_text(_font_table_xml(), encoding="utf-8")
@@ -853,6 +1539,7 @@ def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, fai
         '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/webSettings" Target="webSettings.xml"/>'
         '<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/>'
         '<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>'
+        '<Relationship Id="rId6" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>'
         + ''.join(rels)
         + '</Relationships>',
         encoding="utf-8",
@@ -876,6 +1563,7 @@ def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, fai
         '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
         '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
         '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        '<Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'
         '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
         '<Override PartName="/word/webSettings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml"/>'
         '<Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/>'
