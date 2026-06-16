@@ -1,17 +1,32 @@
 # coding: utf-8
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
 import queue
+import shutil
+import struct
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
+import zipfile
+from xml.sax.saxutils import escape
 
+import numpy as np
+
+from qar_common import numeric_array, numeric_columns, read_qar_csv
 
 ROOT_DIR = Path(__file__).resolve().parent
 PICS_DIR = ROOT_DIR / "pics"
+REPORT_BASENAME = "QAR批量分析报告"
+AIRCRAFT_ORDER = ("CFM", "LEAP", "PW")
+AIRCRAFT_DISPLAY = {
+    "CFM": "CFM",
+    "LEAP": "LEAP",
+    "PW": "PW",
+}
 
 
 @dataclass
@@ -64,6 +79,10 @@ def unique_output_path(person, aircraft):
         index += 1
 
 
+def unique_report_path():
+    return ROOT_DIR / f"{REPORT_BASENAME}.docx"
+
+
 def scan_data_root(data_root):
     tasks = []
     skipped = []
@@ -107,6 +126,13 @@ def scan_data_root(data_root):
     return tasks, skipped, errors
 
 
+def grouped_tasks(tasks):
+    grouped = {}
+    for task in tasks:
+        grouped.setdefault(task.person, {})[task.aircraft] = task
+    return dict(sorted(grouped.items(), key=lambda item: item[0].lower()))
+
+
 def load_analysis_modules():
     modules = {}
     for aircraft, module_path in MODULE_PATHS.items():
@@ -117,6 +143,753 @@ def load_analysis_modules():
         spec.loader.exec_module(module)
         modules[aircraft] = module
     return modules
+
+
+def _collect_cfm_takeoff_points(path):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    dy = "N1 Actual Eng 1"
+    height = "RADIO HEIGHT (R/A1) SYS. 1_1"
+    pitch_cols = [
+        "Capt Pitch Command Positi_1",
+        "Capt Pitch Command Positi_2",
+        "Capt Pitch Command Positi_3",
+        "Capt Pitch Command Positi_4",
+        "Capt Pitch Command Positi_5",
+        "Capt Pitch Command Positi_6",
+        "Capt Pitch Command Positi_7",
+        "Capt Pitch Command Positi_8",
+    ]
+    roll_cols = [
+        "Capt Roll Command Positio_1",
+        "Capt Roll Command Positio_2",
+        "Capt Roll Command Positio_3",
+        "Capt Roll Command Positio_4",
+        "Capt Roll Command Positio_5",
+        "Capt Roll Command Positio_6",
+        "Capt Roll Command Positio_7",
+        "Capt Roll Command Positio_8",
+    ]
+    required = [dy, height] + pitch_cols + roll_cols
+    if any(column not in data.columns for column in required):
+        return np.array([]), np.array([])
+
+    heights = numeric_columns(data, [height]).iloc[:, 0]
+    n1 = numeric_columns(data, [dy]).iloc[:, 0]
+    selected = data.loc[(heights < 50) & (n1 >= 50)]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    selected_indexes = list(selected.index)
+    cut_count = len(selected_indexes)
+    for index in range(1, len(selected_indexes)):
+        if selected_indexes[index] - selected_indexes[index - 1] > 2:
+            cut_count = max(index - 1, 0)
+            break
+    selected = selected.loc[selected_indexes[:cut_count]]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    pitch = numeric_columns(selected, pitch_cols)
+    selected = selected.loc[(pitch >= 0).sum(axis=1) == 0]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    x_values = numeric_array(selected, roll_cols).reshape(-1)
+    y_values = -numeric_array(selected, pitch_cols).reshape(-1)
+    return x_values[np.isfinite(x_values)], y_values[np.isfinite(y_values)]
+
+
+def _collect_pw_takeoff_points(path, leap=False):
+    data = read_qar_csv(path).drop(index=0).reset_index(drop=True)
+    pitch_cols = [
+        "PITCH CAPT CMD POSITION_58",
+        "PITCH CAPT CMD POSITION_186",
+        "PITCH CAPT CMD POSITION_314",
+        "PITCH CAPT CMD POSITION_442",
+        "PITCH CAPT CMD POSITION_570",
+        "PITCH CAPT CMD POSITION_698",
+        "PITCH CAPT CMD POSITION_826",
+        "PITCH CAPT CMD POSITION_954",
+    ]
+    roll_cols = [
+        "ROLL CAPT CMD POSITION_46",
+        "ROLL CAPT CMD POSITION_174",
+        "ROLL CAPT CMD POSITION_302",
+        "ROLL CAPT CMD POSITION_430",
+        "ROLL CAPT CMD POSITION_558",
+        "ROLL CAPT CMD POSITION_686",
+        "ROLL CAPT CMD POSITION_814",
+        "ROLL CAPT CMD POSITION_942",
+    ]
+    n1_col = "N1 ACTUAL (LOW ROTOR SPEED) SYS. 1" if leap else "N1 TARGET SYS 1"
+    height_col = "RADIO ALTITUDE SYS. 1_5" if leap else "RADIO HEIGHT (R/A1) SYS. 1_5"
+    required = [n1_col, height_col] + pitch_cols + roll_cols
+    if any(column not in data.columns for column in required):
+        return np.array([]), np.array([])
+
+    n1 = numeric_columns(data, [n1_col]).iloc[:, 0]
+    selected = data.loc[n1 >= 50]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    pitch = numeric_columns(selected, pitch_cols)
+    selected = selected.loc[(pitch < 0).sum(axis=1) > 0]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    heights = numeric_columns(selected, [height_col]).iloc[:, 0]
+    indexes = []
+    for row_index, value in heights.items():
+        indexes.append(row_index)
+        if value > 50:
+            break
+    selected = data.loc[indexes]
+    if selected.empty:
+        return np.array([]), np.array([])
+
+    x_values = numeric_array(selected, roll_cols).reshape(-1)
+    y_values = -numeric_array(selected, pitch_cols).reshape(-1)
+    if leap:
+        x_values = -x_values
+    return x_values[np.isfinite(x_values)], y_values[np.isfinite(y_values)]
+
+
+def collect_takeoff_points(task):
+    collectors = {
+        "CFM": lambda path: _collect_cfm_takeoff_points(path),
+        "LEAP": lambda path: _collect_pw_takeoff_points(path, leap=True),
+        "PW": lambda path: _collect_pw_takeoff_points(path, leap=False),
+    }
+    x_parts = []
+    y_parts = []
+    for path in task.paths:
+        try:
+            x_values, y_values = collectors[task.aircraft](path)
+        except Exception:
+            continue
+        if len(x_values) and len(y_values):
+            x_parts.append(x_values)
+            y_parts.append(y_values)
+    if not x_parts or not y_parts:
+        return np.array([]), np.array([])
+    return np.concatenate(x_parts), np.concatenate(y_parts)
+
+
+def takeoff_analysis_text(task):
+    x_values, y_values = collect_takeoff_points(task)
+    if not len(x_values) or not len(y_values):
+        return f"{task.aircraft}机型起飞50ft以下杆量无法自动计算。"
+
+    highest = float(np.nanmax(y_values))
+    lowest = float(np.nanmin(y_values))
+    lateral = float(np.nanmax(np.abs(x_values)))
+    if lowest >= 0:
+        status = "起飞杆量正常"
+        steady_text = ""
+    elif abs(lowest) <= 5:
+        status = "起飞有少量稳杆"
+        steady_text = f"，稳杆量最大约{abs(lowest):.1f}个单位"
+    else:
+        status = "起飞有稳杆"
+        steady_text = f"，稳杆量最大约{abs(lowest):.1f}个单位"
+
+    pull_value = highest if highest > 0 else 0.0
+    return (
+        f"{task.aircraft}机型{status}，"
+        f"带杆量最大约{pull_value:.1f}个单位"
+        f"{steady_text}，横侧杆量{lateral:.1f}个单位。"
+    )
+
+
+def _set_run_font(run, size=None, bold=None, color=None):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt, RGBColor
+
+    latin_font = "Calibri"
+    cjk_font = "Microsoft YaHei"
+    run.font.name = latin_font
+    if size is not None:
+        run.font.size = Pt(size)
+    if bold is not None:
+        run.bold = bold
+    if color is not None:
+        run.font.color.rgb = RGBColor.from_string(color)
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.rFonts
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:ascii"), latin_font)
+    rfonts.set(qn("w:hAnsi"), latin_font)
+    rfonts.set(qn("w:eastAsia"), cjk_font)
+    rfonts.set(qn("w:cs"), latin_font)
+
+
+def _set_style_font(style, size=None, bold=None, color=None):
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt, RGBColor
+
+    latin_font = "Calibri"
+    cjk_font = "Microsoft YaHei"
+    style.font.name = latin_font
+    if size is not None:
+        style.font.size = Pt(size)
+    if bold is not None:
+        style.font.bold = bold
+    if color is not None:
+        style.font.color.rgb = RGBColor.from_string(color)
+    rpr = style.element.get_or_add_rPr()
+    rfonts = rpr.rFonts
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.append(rfonts)
+    rfonts.set(qn("w:ascii"), latin_font)
+    rfonts.set(qn("w:hAnsi"), latin_font)
+    rfonts.set(qn("w:eastAsia"), cjk_font)
+    rfonts.set(qn("w:cs"), latin_font)
+
+
+def _add_paragraph(document, text="", style=None, size=11, bold=False, color=None):
+    paragraph = document.add_paragraph(style=style) if style else document.add_paragraph()
+    if text:
+        run = paragraph.add_run(text)
+        _set_run_font(run, size=size, bold=bold, color=color)
+    return paragraph
+
+
+def _add_heading(document, text, level=1):
+    paragraph = document.add_heading("", level=level)
+    run = paragraph.add_run(text)
+    _set_run_font(run, size=16 if level == 1 else 13, bold=True, color="2E74B5")
+    return paragraph
+
+
+def configure_report_styles(document):
+    from docx.shared import Inches, Pt
+
+    section = document.sections[0]
+    section.top_margin = Inches(1)
+    section.bottom_margin = Inches(1)
+    section.left_margin = Inches(1)
+    section.right_margin = Inches(1)
+
+    styles = document.styles
+    _set_style_font(styles["Normal"], size=11)
+    styles["Normal"].paragraph_format.space_after = Pt(6)
+    _set_style_font(styles["Heading 1"], size=16, bold=True, color="2E74B5")
+    styles["Heading 1"].paragraph_format.space_before = Pt(16)
+    styles["Heading 1"].paragraph_format.space_after = Pt(8)
+    _set_style_font(styles["Heading 2"], size=13, bold=True, color="2E74B5")
+    styles["Heading 2"].paragraph_format.space_before = Pt(12)
+    styles["Heading 2"].paragraph_format.space_after = Pt(6)
+    if "List Bullet" in styles:
+        _set_style_font(styles["List Bullet"], size=11)
+
+
+def build_report_items(successful_tasks, skipped, validation_errors, failures):
+    items = [
+        ("title", "QAR批量分析报告"),
+        (
+            "paragraph",
+            "本报告由批量分析程序自动生成。所有人员和不同机型写入同一个文档，按人员依次汇总 CFM、LEAP、PW 的分析图片与基础文字结论。",
+        ),
+    ]
+    if skipped or validation_errors or failures:
+        items.append(
+            (
+                "note",
+                f"运行提示：跳过{len(skipped)}项，数据校验错误{len(validation_errors)}项，分析失败{len(failures)}项。",
+            )
+        )
+
+    tasks_by_person = grouped_tasks(successful_tasks)
+    for person, aircraft_tasks in tasks_by_person.items():
+        items.append(("person", person))
+
+        counts = {aircraft: len(aircraft_tasks[aircraft].paths) if aircraft in aircraft_tasks else 0 for aircraft in AIRCRAFT_ORDER}
+        total = sum(counts.values())
+        analysis_parts = []
+        for aircraft in AIRCRAFT_ORDER:
+            task = aircraft_tasks.get(aircraft)
+            if task is None:
+                continue
+
+            items.append(("aircraft", AIRCRAFT_DISPLAY[aircraft]))
+            if task.output_path.exists():
+                items.append(("image", task.output_path))
+            else:
+                items.append(("warning", f"未找到结果图片：{task.output_path}"))
+            analysis_parts.append(takeoff_analysis_text(task))
+
+        items.append(("analysis_label", "分析："))
+        items.append(
+            (
+                "paragraph",
+                (
+                    f"分析：共选取当月CFM：{counts['CFM']}段，"
+                    f"LEAP：{counts['LEAP']}段，PW：{counts['PW']}段，"
+                    f"共计{total}段正常航班数据。"
+                ),
+            )
+        )
+        if analysis_parts:
+            items.append(("paragraph", "1.起飞50ft以下杆量：" + "；".join(analysis_parts)))
+        else:
+            items.append(("paragraph", "1.起飞50ft以下杆量：该人员无可写入的机型图片和分析数据。"))
+
+    return items
+
+
+def generate_report(successful_tasks, skipped, validation_errors, failures):
+    try:
+        return generate_report_with_python_docx(successful_tasks, skipped, validation_errors, failures)
+    except ModuleNotFoundError as exc:
+        if exc.name != "docx":
+            raise
+        return generate_report_with_ooxml(successful_tasks, skipped, validation_errors, failures)
+
+
+def generate_report_with_python_docx(successful_tasks, skipped, validation_errors, failures):
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Inches
+
+    report_path = unique_report_path()
+    document = Document()
+    configure_report_styles(document)
+
+    for item_type, value in build_report_items(successful_tasks, skipped, validation_errors, failures):
+        if item_type == "title":
+            title = document.add_paragraph()
+            title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            title_run = title.add_run(value)
+            _set_run_font(title_run, size=20, bold=True)
+        elif item_type == "person":
+            _add_heading(document, value, level=1)
+        elif item_type == "aircraft":
+            _add_heading(document, value, level=2)
+        elif item_type == "image":
+            document.add_picture(str(value), width=Inches(6.2))
+            document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        elif item_type == "warning":
+            _add_paragraph(document, value, color="9B1C1C")
+        elif item_type == "note":
+            _add_paragraph(document, value, size=10, color="555555")
+        elif item_type == "analysis_label":
+            _add_paragraph(document, value, bold=True)
+        else:
+            _add_paragraph(document, value)
+
+    document.save(report_path)
+    return report_path
+
+
+def _image_size(path):
+    with open(path, "rb") as image_file:
+        header = image_file.read(24)
+    if header.startswith(b"\x89PNG\r\n\x1a\n") and len(header) >= 24:
+        return struct.unpack(">II", header[16:24])
+    return 1200, 600
+
+
+def _paragraph_xml(text, style=None, bold=False, color=None, align=None):
+    escaped = escape(str(text))
+    ppr_parts = []
+    if style:
+        ppr_parts.append(f'<w:pStyle w:val="{style}"/>')
+    if align:
+        ppr_parts.append(f'<w:jc w:val="{align}"/>')
+    ppr = f"<w:pPr>{''.join(ppr_parts)}</w:pPr>" if ppr_parts else ""
+    run_props = [
+        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/>',
+    ]
+    if bold:
+        run_props.append("<w:b/>")
+    if color:
+        run_props.append(f'<w:color w:val="{color}"/>')
+    rpr = f"<w:rPr>{''.join(run_props)}</w:rPr>"
+    return f"<w:p>{ppr}<w:r>{rpr}<w:t>{escaped}</w:t></w:r></w:p>"
+
+
+def _image_xml(rel_id, image_name, cx, cy):
+    escaped_name = escape(image_name)
+    return f"""
+<w:p>
+  <w:pPr><w:jc w:val="center"/></w:pPr>
+  <w:r>
+    <w:drawing>
+      <wp:inline distT="0" distB="0" distL="0" distR="0">
+        <wp:extent cx="{cx}" cy="{cy}"/>
+        <wp:effectExtent l="0" t="0" r="0" b="0"/>
+        <wp:docPr id="{rel_id[3:]}" name="{escaped_name}"/>
+        <wp:cNvGraphicFramePr>
+          <a:graphicFrameLocks noChangeAspect="1"/>
+        </wp:cNvGraphicFramePr>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+            <pic:pic>
+              <pic:nvPicPr>
+                <pic:cNvPr id="0" name="{escaped_name}"/>
+                <pic:cNvPicPr/>
+              </pic:nvPicPr>
+              <pic:blipFill>
+                <a:blip r:embed="{rel_id}"/>
+                <a:stretch><a:fillRect/></a:stretch>
+              </pic:blipFill>
+              <pic:spPr>
+                <a:xfrm>
+                  <a:off x="0" y="0"/>
+                  <a:ext cx="{cx}" cy="{cy}"/>
+                </a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+              </pic:spPr>
+            </pic:pic>
+          </a:graphicData>
+        </a:graphic>
+      </wp:inline>
+    </w:drawing>
+  </w:r>
+</w:p>
+"""
+
+
+def _styles_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>
+    <w:pPrDefault><w:pPr><w:spacing w:after="120"/></w:pPr></w:pPrDefault>
+  </w:docDefaults>
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:spacing w:before="320" w:after="160"/><w:outlineLvl w:val="0"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/><w:b/><w:color w:val="2E74B5"/><w:sz w:val="32"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading2">
+    <w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>
+    <w:pPr><w:spacing w:before="240" w:after="120"/><w:outlineLvl w:val="1"/></w:pPr>
+    <w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Calibri"/><w:b/><w:color w:val="2E74B5"/><w:sz w:val="26"/></w:rPr>
+  </w:style>
+</w:styles>
+"""
+
+
+def _settings_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:settings xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+ xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+ xmlns:v="urn:schemas-microsoft-com:vml"
+ xmlns:w10="urn:schemas-microsoft-com:office:word"
+ xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+ xmlns:sl="http://schemas.openxmlformats.org/schemaLibrary/2006/main"
+ mc:Ignorable="w14">
+  <w:zoom w:val="bestFit"/>
+  <w:defaultTabStop w:val="720"/>
+  <w:characterSpacingControl w:val="doNotCompress"/>
+  <w:compat>
+    <w:useFELayout/>
+    <w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="14"/>
+  </w:compat>
+  <w:themeFontLang w:val="zh-CN" w:eastAsia="zh-CN"/>
+</w:settings>
+"""
+
+
+def _web_settings_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:webSettings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:allowPNG/>
+</w:webSettings>
+"""
+
+
+def _font_table_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:font w:name="Calibri">
+    <w:charset w:val="00"/>
+    <w:family w:val="swiss"/>
+    <w:pitch w:val="variable"/>
+  </w:font>
+  <w:font w:name="Microsoft YaHei">
+    <w:charset w:val="86"/>
+    <w:family w:val="swiss"/>
+    <w:pitch w:val="variable"/>
+  </w:font>
+</w:fonts>
+"""
+
+
+def _theme_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme">
+  <a:themeElements>
+    <a:clrScheme name="Office">
+      <a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1>
+      <a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1>
+      <a:dk2><a:srgbClr val="44546A"/></a:dk2>
+      <a:lt2><a:srgbClr val="E7E6E6"/></a:lt2>
+      <a:accent1><a:srgbClr val="4472C4"/></a:accent1>
+      <a:accent2><a:srgbClr val="ED7D31"/></a:accent2>
+      <a:accent3><a:srgbClr val="A5A5A5"/></a:accent3>
+      <a:accent4><a:srgbClr val="FFC000"/></a:accent4>
+      <a:accent5><a:srgbClr val="5B9BD5"/></a:accent5>
+      <a:accent6><a:srgbClr val="70AD47"/></a:accent6>
+      <a:hlink><a:srgbClr val="0563C1"/></a:hlink>
+      <a:folHlink><a:srgbClr val="954F72"/></a:folHlink>
+    </a:clrScheme>
+    <a:fontScheme name="Office">
+      <a:majorFont><a:latin typeface="Calibri Light"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Calibri"/></a:majorFont>
+      <a:minorFont><a:latin typeface="Calibri"/><a:ea typeface="Microsoft YaHei"/><a:cs typeface="Calibri"/></a:minorFont>
+    </a:fontScheme>
+    <a:fmtScheme name="Office">
+      <a:fillStyleLst>
+        <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+        <a:gradFill rotWithShape="1">
+          <a:gsLst>
+            <a:gs pos="0"><a:schemeClr val="phClr"><a:lumMod val="110000"/><a:satMod val="105000"/><a:tint val="67000"/></a:schemeClr></a:gs>
+            <a:gs pos="50000"><a:schemeClr val="phClr"><a:lumMod val="105000"/><a:satMod val="103000"/><a:tint val="73000"/></a:schemeClr></a:gs>
+            <a:gs pos="100000"><a:schemeClr val="phClr"><a:lumMod val="105000"/><a:satMod val="109000"/><a:tint val="81000"/></a:schemeClr></a:gs>
+          </a:gsLst>
+          <a:lin ang="5400000" scaled="0"/>
+        </a:gradFill>
+        <a:gradFill rotWithShape="1">
+          <a:gsLst>
+            <a:gs pos="0"><a:schemeClr val="phClr"><a:satMod val="103000"/><a:lumMod val="102000"/><a:tint val="94000"/></a:schemeClr></a:gs>
+            <a:gs pos="50000"><a:schemeClr val="phClr"><a:satMod val="110000"/><a:lumMod val="100000"/><a:shade val="100000"/></a:schemeClr></a:gs>
+            <a:gs pos="100000"><a:schemeClr val="phClr"><a:lumMod val="99000"/><a:satMod val="120000"/><a:shade val="78000"/></a:schemeClr></a:gs>
+          </a:gsLst>
+          <a:lin ang="5400000" scaled="0"/>
+        </a:gradFill>
+      </a:fillStyleLst>
+      <a:lnStyleLst>
+        <a:ln w="6350" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/><a:miter lim="800000"/></a:ln>
+        <a:ln w="12700" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/><a:miter lim="800000"/></a:ln>
+        <a:ln w="19050" cap="flat" cmpd="sng" algn="ctr"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:prstDash val="solid"/><a:miter lim="800000"/></a:ln>
+      </a:lnStyleLst>
+      <a:effectStyleLst>
+        <a:effectStyle><a:effectLst/></a:effectStyle>
+        <a:effectStyle><a:effectLst/></a:effectStyle>
+        <a:effectStyle>
+          <a:effectLst>
+            <a:outerShdw blurRad="57150" dist="19050" dir="5400000" algn="ctr" rotWithShape="0">
+              <a:srgbClr val="000000"><a:alpha val="63000"/></a:srgbClr>
+            </a:outerShdw>
+          </a:effectLst>
+        </a:effectStyle>
+      </a:effectStyleLst>
+      <a:bgFillStyleLst>
+        <a:solidFill><a:schemeClr val="phClr"/></a:solidFill>
+        <a:gradFill rotWithShape="1">
+          <a:gsLst>
+            <a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="40000"/><a:satMod val="350000"/></a:schemeClr></a:gs>
+            <a:gs pos="40000"><a:schemeClr val="phClr"><a:tint val="45000"/><a:shade val="99000"/><a:satMod val="350000"/></a:schemeClr></a:gs>
+            <a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="20000"/><a:satMod val="255000"/></a:schemeClr></a:gs>
+          </a:gsLst>
+          <a:path path="circle"><a:fillToRect l="50000" t="-80000" r="50000" b="180000"/></a:path>
+        </a:gradFill>
+        <a:gradFill rotWithShape="1">
+          <a:gsLst>
+            <a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="80000"/><a:satMod val="300000"/></a:schemeClr></a:gs>
+            <a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="30000"/><a:satMod val="200000"/></a:schemeClr></a:gs>
+          </a:gsLst>
+          <a:path path="circle"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path>
+        </a:gradFill>
+      </a:bgFillStyleLst>
+    </a:fmtScheme>
+  </a:themeElements>
+  <a:objectDefaults/>
+  <a:extraClrSchemeLst/>
+</a:theme>
+"""
+
+
+def _core_properties_xml():
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:dcterms="http://purl.org/dc/terms/"
+ xmlns:dcmitype="http://purl.org/dc/dcmitype/"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <dc:title>QAR批量分析报告</dc:title>
+  <dc:creator>QAR Batch Analyzer</dc:creator>
+  <cp:lastModifiedBy>QAR Batch Analyzer</cp:lastModifiedBy>
+  <cp:revision>1</cp:revision>
+  <dcterms:created xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:created>
+  <dcterms:modified xsi:type="dcterms:W3CDTF">{timestamp}</dcterms:modified>
+</cp:coreProperties>
+"""
+
+
+def _app_properties_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+ xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">
+  <Template>Normal.dotm</Template>
+  <TotalTime>0</TotalTime>
+  <Pages>1</Pages>
+  <Words>0</Words>
+  <Characters>0</Characters>
+  <Application>Microsoft Word</Application>
+  <DocSecurity>0</DocSecurity>
+  <Lines>0</Lines>
+  <Paragraphs>0</Paragraphs>
+  <ScaleCrop>false</ScaleCrop>
+  <Company/>
+  <LinksUpToDate>false</LinksUpToDate>
+  <CharactersWithSpaces>0</CharactersWithSpaces>
+  <SharedDoc>false</SharedDoc>
+  <HyperlinksChanged>false</HyperlinksChanged>
+  <AppVersion>16.0000</AppVersion>
+</Properties>
+"""
+
+
+def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, failures):
+    report_path = unique_report_path()
+    temp_dir = report_path.with_suffix(".docx_parts")
+    doc_props_dir = temp_dir / "docProps"
+    word_dir = temp_dir / "word"
+    rels_dir = word_dir / "_rels"
+    media_dir = word_dir / "media"
+    theme_dir = word_dir / "theme"
+    root_rels_dir = temp_dir / "_rels"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    doc_props_dir.mkdir(parents=True)
+    media_dir.mkdir(parents=True)
+    rels_dir.mkdir(parents=True)
+    theme_dir.mkdir(parents=True)
+    root_rels_dir.mkdir(parents=True)
+
+    body_parts = []
+    rels = []
+    image_index = 1
+    rel_index = 9
+    image_width_emu = int(6.2 * 914400)
+
+    for item_type, value in build_report_items(successful_tasks, skipped, validation_errors, failures):
+        if item_type == "title":
+            body_parts.append(_paragraph_xml(value, bold=True, align="center"))
+        elif item_type == "person":
+            body_parts.append(_paragraph_xml(value, style="Heading1", bold=True, color="2E74B5"))
+        elif item_type == "aircraft":
+            body_parts.append(_paragraph_xml(value, style="Heading2", bold=True, color="2E74B5"))
+        elif item_type == "image":
+            source_path = Path(value)
+            image_name = f"image{image_index}{source_path.suffix.lower() or '.png'}"
+            target_path = media_dir / image_name
+            shutil.copyfile(source_path, target_path)
+            width_px, height_px = _image_size(source_path)
+            image_height_emu = int(image_width_emu * height_px / max(width_px, 1))
+            rel_id = f"rId{rel_index}"
+            body_parts.append(_image_xml(rel_id, image_name, image_width_emu, image_height_emu))
+            rels.append(
+                f'<Relationship Id="{rel_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/{image_name}"/>'
+            )
+            image_index += 1
+            rel_index += 1
+        elif item_type == "warning":
+            body_parts.append(_paragraph_xml(value, color="9B1C1C"))
+        elif item_type == "note":
+            body_parts.append(_paragraph_xml(value, color="555555"))
+        elif item_type == "analysis_label":
+            body_parts.append(_paragraph_xml(value, bold=True))
+        else:
+            body_parts.append(_paragraph_xml(value))
+
+    section_props = """
+<w:sectPr>
+  <w:pgSz w:w="12240" w:h="15840"/>
+  <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>
+</w:sectPr>
+"""
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+ xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+ xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+ xmlns:o="urn:schemas-microsoft-com:office:office"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+ xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+ xmlns:v="urn:schemas-microsoft-com:vml"
+ xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+ xmlns:w10="urn:schemas-microsoft-com:office:word"
+ xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+ xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+ xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+ xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"
+ xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"
+ xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+ xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+ xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"
+ mc:Ignorable="w14">
+  <w:body>
+    {''.join(body_parts)}
+    {section_props}
+  </w:body>
+</w:document>
+"""
+
+    (doc_props_dir / "core.xml").write_text(_core_properties_xml(), encoding="utf-8")
+    (doc_props_dir / "app.xml").write_text(_app_properties_xml(), encoding="utf-8")
+    (word_dir / "document.xml").write_text(document_xml, encoding="utf-8")
+    (word_dir / "styles.xml").write_text(_styles_xml(), encoding="utf-8")
+    (word_dir / "settings.xml").write_text(_settings_xml(), encoding="utf-8")
+    (word_dir / "webSettings.xml").write_text(_web_settings_xml(), encoding="utf-8")
+    (word_dir / "fontTable.xml").write_text(_font_table_xml(), encoding="utf-8")
+    (theme_dir / "theme1.xml").write_text(_theme_xml(), encoding="utf-8")
+    (rels_dir / "document.xml.rels").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/webSettings" Target="webSettings.xml"/>'
+        '<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/fontTable" Target="fontTable.xml"/>'
+        '<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>'
+        + ''.join(rels)
+        + '</Relationships>',
+        encoding="utf-8",
+    )
+    (root_rels_dir / ".rels").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+        '</Relationships>',
+        encoding="utf-8",
+    )
+    (temp_dir / "[Content_Types].xml").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Default Extension="png" ContentType="image/png"/>'
+        '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+        '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+        '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
+        '<Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/>'
+        '<Override PartName="/word/webSettings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.webSettings+xml"/>'
+        '<Override PartName="/word/fontTable.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.fontTable+xml"/>'
+        '<Override PartName="/word/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+        '</Types>',
+        encoding="utf-8",
+    )
+
+    with zipfile.ZipFile(report_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for part in temp_dir.rglob("*"):
+            if part.is_file():
+                archive.write(part, part.relative_to(temp_dir).as_posix())
+    shutil.rmtree(temp_dir)
+    return report_path
 
 
 class ProgressWindow:
@@ -159,9 +932,10 @@ class ProgressWindow:
             self.progress_var.set(f"进度：{done} / {self.total}")
 
 
-def worker(tasks, modules, events):
+def worker(tasks, modules, events, skipped, validation_errors):
     completed = 0
     failures = []
+    successful_tasks = []
     total = len(tasks)
 
     for index, task in enumerate(tasks, start=1):
@@ -172,6 +946,7 @@ def worker(tasks, modules, events):
                 [str(path) for path in task.paths],
                 str(task.output_path),
             )
+            successful_tasks.append(task)
             completed += 1
             events.put(("status", task.person, task.aircraft, f"已生成：{task.output_path.name}", completed))
         except Exception as exc:
@@ -179,7 +954,18 @@ def worker(tasks, modules, events):
             completed += 1
             events.put(("status", task.person, task.aircraft, "分析失败，已继续后续任务", completed))
 
-    events.put(("done", total - len(failures), failures))
+    report_path = None
+    report_error = None
+    if successful_tasks:
+        try:
+            events.put(("status", "汇总报告", "DOCX", "正在生成 DOCX 分析报告", completed))
+            report_path = generate_report(successful_tasks, skipped, validation_errors, failures)
+            events.put(("status", "汇总报告", "DOCX", f"已生成报告：{report_path.name}", completed))
+        except Exception as exc:
+            report_error = (str(exc), traceback.format_exc())
+            events.put(("status", "汇总报告", "DOCX", "DOCX 报告生成失败", completed))
+
+    events.put(("done", total - len(failures), failures, report_path, report_error))
 
 
 def show_initial_errors(errors):
@@ -203,7 +989,7 @@ def run_progress_window(tasks, skipped, validation_errors):
         root.destroy()
         return
 
-    thread = threading.Thread(target=worker, args=(tasks, modules, events), daemon=True)
+    thread = threading.Thread(target=worker, args=(tasks, modules, events, skipped, validation_errors), daemon=True)
     thread.start()
 
     def poll_events():
@@ -214,9 +1000,9 @@ def run_progress_window(tasks, skipped, validation_errors):
                     _, person, aircraft, status, done = event
                     progress_window.update_status(person, aircraft, status, done)
                 elif event[0] == "done":
-                    _, completed, failures = event
+                    _, completed, failures, report_path, report_error = event
                     progress_window.update_status(status="全部任务处理完成", done=len(tasks))
-                    total_errors = len(validation_errors) + len(failures)
+                    total_errors = len(validation_errors) + len(failures) + (1 if report_error else 0)
                     summary = (
                         f"批量分析完成。\n\n"
                         f"成功：{completed}\n"
@@ -224,9 +1010,13 @@ def run_progress_window(tasks, skipped, validation_errors):
                         f"错误：{total_errors}\n\n"
                         f"图片目录：{PICS_DIR}"
                     )
+                    if report_path:
+                        summary += f"\n报告文件：{report_path}"
                     if failures:
                         first_failure = failures[0]
                         summary += f"\n\n首个分析失败：{first_failure[0]} {first_failure[1]}：{first_failure[2]}"
+                    if report_error:
+                        summary += f"\n\n报告生成失败：{report_error[0]}"
                     messagebox.showinfo("完成", summary)
                     root.destroy()
                     return
