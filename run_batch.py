@@ -53,6 +53,13 @@ class DataAnalysisFile:
     flight_segment: str
 
 
+@dataclass
+class RunOptions:
+    generate_images: bool = True
+    generate_docx: bool = True
+    generate_xlsx: bool = True
+
+
 AIRCRAFT_DIRS = {
     "cfm": "CFM",
     "leap": "LEAP",
@@ -104,7 +111,7 @@ AIRCRAFT_METRIC_CONFIG = {
             ["Throttle lever angle Eng2_1", "Throttle lever angle Eng2_2"],
         ],
         "throttle_mode": "any_each_group_below_one",
-        "takeoff_groups": [("D", "J", 3, 1), ("K", "Q", 3, 1)],
+        "takeoff_groups": [("D", "J", 2, 2), ("K", "Q", 2, 2)],
         "takeoff_attitude_column": "R",
     },
     "LEAP": {
@@ -119,7 +126,7 @@ AIRCRAFT_METRIC_CONFIG = {
         "ap_pitch_headers": [f"PITCH CAPT CMD POSITION_{suffix}" for suffix in (58, 186, 314, 442, 570, 698, 826, 954)],
         "throttle_groups": [["THRUST LEVER ANGLE POS SYS. 1", "THRUST LEVER ANGLE POS SYS. 2"]],
         "throttle_mode": "all_below_one",
-        "takeoff_groups": [("D", "H", 2, 1), ("I", "M", 2, 1)],
+        "takeoff_groups": [("D", "H", 1, 2), ("I", "M", 1, 2)],
         "takeoff_attitude_column": "N",
     },
     "PW": {
@@ -137,7 +144,7 @@ AIRCRAFT_METRIC_CONFIG = {
             ["THROTTLE LEVER ANGLE ENG 2 (CFM)_208", "THROTTLE LEVER ANGLE ENG 2 (CFM)_720"],
         ],
         "throttle_mode": "any_each_group_below_one",
-        "takeoff_groups": [("D", "H", 2, 1), ("I", "M", 2, 1)],
+        "takeoff_groups": [("D", "H", 1, 2), ("I", "M", 2, 2)],
         "takeoff_attitude_column": "N",
     },
 }
@@ -2347,27 +2354,32 @@ class ProgressWindow:
             self.progress_var.set(f"进度：{done} / {self.total}")
 
 
-def worker(tasks, modules, events, skipped, validation_errors, data_root):
+def worker(tasks, modules, events, skipped, validation_errors, data_root, options):
     completed = 0
     failures = []
+    notes = []
     successful_tasks = []
     total = len(tasks)
 
-    for index, task in enumerate(tasks, start=1):
-        events.put(("status", task.person, task.aircraft, "正在读取 CSV", completed))
-        try:
-            events.put(("status", task.person, task.aircraft, "正在生成图片", completed))
-            modules[task.aircraft].more_pic(
-                [str(path) for path in task.paths],
-                str(task.output_path),
-            )
-            successful_tasks.append(task)
-            completed += 1
-            events.put(("status", task.person, task.aircraft, f"已生成：{task.output_path.name}", completed))
-        except Exception as exc:
-            failures.append((task.person, task.aircraft, str(exc), traceback.format_exc()))
-            completed += 1
-            events.put(("status", task.person, task.aircraft, "分析失败，已继续后续任务", completed))
+    if options.generate_images:
+        for index, task in enumerate(tasks, start=1):
+            events.put(("status", task.person, task.aircraft, "正在读取 CSV", completed))
+            try:
+                events.put(("status", task.person, task.aircraft, "正在生成图片", completed))
+                modules[task.aircraft].more_pic(
+                    [str(path) for path in task.paths],
+                    str(task.output_path),
+                )
+                successful_tasks.append(task)
+                completed += 1
+                events.put(("status", task.person, task.aircraft, f"已生成：{task.output_path.name}", completed))
+            except Exception as exc:
+                failures.append((task.person, task.aircraft, str(exc), traceback.format_exc()))
+                completed += 1
+                events.put(("status", task.person, task.aircraft, "分析失败，已继续后续任务", completed))
+    else:
+        notes.append("图片生成：已跳过。")
+        events.put(("status", "图片生成", "-", "已跳过图片生成", completed))
 
     report_path = None
     report_error = None
@@ -2375,15 +2387,26 @@ def worker(tasks, modules, events, skipped, validation_errors, data_root):
     xlsx_error = None
     xlsx_count = 0
     xlsx_errors = []
-    if successful_tasks:
-        # try:
-        #     events.put(("status", "汇总报告", "DOCX", "正在生成 DOCX 分析报告", completed))
-        #     report_path = generate_report(successful_tasks, skipped, validation_errors, failures)
-        #     events.put(("status", "汇总报告", "DOCX", f"已生成报告：{report_path.name}", completed))
-        # except Exception as exc:
-        #     report_error = (str(exc), traceback.format_exc())
-        #     events.put(("status", "汇总报告", "DOCX", "DOCX 报告生成失败", completed))
 
+    if options.generate_docx:
+        if not options.generate_images:
+            notes.append("DOCX 需要本次生成的图片结果，本次已跳过。")
+            events.put(("status", "汇总报告", "DOCX", "DOCX 已跳过：未生成图片", completed))
+        elif not successful_tasks:
+            notes.append("DOCX 已跳过：没有成功生成的图片。")
+            events.put(("status", "汇总报告", "DOCX", "DOCX 已跳过：没有成功图片", completed))
+        else:
+            try:
+                events.put(("status", "汇总报告", "DOCX", "正在生成 DOCX 分析报告", completed))
+                report_path = generate_report(successful_tasks, skipped, validation_errors, failures)
+                events.put(("status", "汇总报告", "DOCX", f"已生成报告：{report_path.name}", completed))
+            except Exception as exc:
+                report_error = (str(exc), traceback.format_exc())
+                events.put(("status", "汇总报告", "DOCX", "DOCX 报告生成失败", completed))
+    else:
+        notes.append("DOCX 文档：已跳过。")
+
+    if options.generate_xlsx:
         try:
             events.put(("status", "数据分析", "XLSX", "正在生成 qar.xlsx 数据分析表", completed))
             xlsx_path, xlsx_count, xlsx_errors = generate_qar_xlsx(data_root)
@@ -2391,8 +2414,10 @@ def worker(tasks, modules, events, skipped, validation_errors, data_root):
         except Exception as exc:
             xlsx_error = (str(exc), traceback.format_exc())
             events.put(("status", "数据分析", "XLSX", "qar.xlsx 生成失败", completed))
+    else:
+        notes.append("qar分析表格：已跳过。")
 
-    events.put(("done", total - len(failures), failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors))
+    events.put(("done", completed, failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors, notes))
 
 
 def show_initial_errors(errors):
@@ -2404,19 +2429,65 @@ def show_initial_errors(errors):
     messagebox.showwarning("数据校验错误", "\n".join(lines))
 
 
-def run_progress_window(tasks, skipped, validation_errors, data_root):
+def ask_run_options():
+    dialog = tk.Tk()
+    dialog.title("生成内容选择")
+    dialog.geometry("320x210")
+    dialog.resizable(False, False)
+
+    generate_images_var = tk.BooleanVar(value=True)
+    generate_docx_var = tk.BooleanVar(value=True)
+    generate_xlsx_var = tk.BooleanVar(value=True)
+    result = {"options": None}
+
+    frame = ttk.Frame(dialog, padding=18)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(frame, text="请选择本次需要生成的内容：").pack(anchor="w", pady=(0, 10))
+    ttk.Checkbutton(frame, text="生成图片", variable=generate_images_var).pack(anchor="w", pady=2)
+    ttk.Checkbutton(frame, text="生成 DOCX 文档", variable=generate_docx_var).pack(anchor="w", pady=2)
+    ttk.Checkbutton(frame, text="生成 qar分析表格", variable=generate_xlsx_var).pack(anchor="w", pady=2)
+
+    button_frame = ttk.Frame(frame)
+    button_frame.pack(fill="x", pady=(18, 0))
+
+    def on_start():
+        options = RunOptions(
+            generate_images=generate_images_var.get(),
+            generate_docx=generate_docx_var.get(),
+            generate_xlsx=generate_xlsx_var.get(),
+        )
+        if not (options.generate_images or options.generate_docx or options.generate_xlsx):
+            messagebox.showwarning("未选择生成内容", "请至少选择一项生成内容。", parent=dialog)
+            return
+        result["options"] = options
+        dialog.destroy()
+
+    def on_cancel():
+        dialog.destroy()
+
+    ttk.Button(button_frame, text="开始", command=on_start).pack(side="right", padx=(8, 0))
+    ttk.Button(button_frame, text="取消", command=on_cancel).pack(side="right")
+    dialog.protocol("WM_DELETE_WINDOW", on_cancel)
+    dialog.mainloop()
+    return result["options"]
+
+
+def run_progress_window(tasks, skipped, validation_errors, data_root, options):
     root = tk.Tk()
     progress_window = ProgressWindow(root, len(tasks))
     events = queue.Queue()
 
-    try:
-        modules = load_analysis_modules()
-    except Exception as exc:
-        messagebox.showerror("加载失败", f"分析模块加载失败：\n{exc}")
-        root.destroy()
-        return
+    modules = {}
+    if options.generate_images:
+        try:
+            modules = load_analysis_modules()
+        except Exception as exc:
+            messagebox.showerror("加载失败", f"分析模块加载失败：\n{exc}")
+            root.destroy()
+            return
 
-    thread = threading.Thread(target=worker, args=(tasks, modules, events, skipped, validation_errors, data_root), daemon=True)
+    thread = threading.Thread(target=worker, args=(tasks, modules, events, skipped, validation_errors, data_root, options), daemon=True)
     thread.start()
 
     def poll_events():
@@ -2427,20 +2498,23 @@ def run_progress_window(tasks, skipped, validation_errors, data_root):
                     _, person, aircraft, status, done = event
                     progress_window.update_status(person, aircraft, status, done)
                 elif event[0] == "done":
-                    _, completed, failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors = event
+                    _, completed, failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors, notes = event
                     progress_window.update_status(status="全部任务处理完成", done=len(tasks))
                     total_errors = len(validation_errors) + len(failures) + len(xlsx_errors) + (1 if report_error else 0) + (1 if xlsx_error else 0)
                     summary = (
                         f"批量分析完成。\n\n"
-                        f"成功：{completed}\n"
+                        f"图片成功：{completed if options.generate_images else 0}\n"
                         f"跳过：{len(skipped)}\n"
-                        f"错误：{total_errors}\n\n"
-                        f"图片目录：{PICS_DIR}"
+                        f"错误：{total_errors}"
                     )
+                    if options.generate_images:
+                        summary += f"\n\n图片目录：{PICS_DIR}"
                     if report_path:
                         summary += f"\n报告文件：{report_path}"
                     if xlsx_path:
                         summary += f"\n数据表文件：{xlsx_path}（{xlsx_count} 条）"
+                    if notes:
+                        summary += "\n\n" + "\n".join(notes)
                     if failures:
                         first_failure = failures[0]
                         summary += f"\n\n首个分析失败：{first_failure[0]} {first_failure[1]}：{first_failure[2]}"
@@ -2477,17 +2551,21 @@ def main():
         messagebox.showerror("路径错误", "选择的数据文件夹不存在。")
         return
 
+    options = ask_run_options()
+    if options is None:
+        return
+
     tasks, skipped, validation_errors = scan_data_root(data_root)
     show_initial_errors(validation_errors)
 
-    if not tasks:
+    if not tasks and (options.generate_images or options.generate_docx) and not options.generate_xlsx:
         messagebox.showinfo(
             "没有可分析数据",
             f"没有找到可分析的人员机型数据。\n\n跳过：{len(skipped)}\n错误：{len(validation_errors)}",
         )
         return
 
-    run_progress_window(tasks, skipped, validation_errors, data_root)
+    run_progress_window(tasks, skipped, validation_errors, data_root, options)
 
 
 if __name__ == "__main__":
