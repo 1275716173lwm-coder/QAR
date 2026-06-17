@@ -20,7 +20,8 @@ import numpy as np
 
 from qar_common import CSV_ENCODINGS, numeric_array, numeric_columns, read_qar_csv
 
-ROOT_DIR = Path(__file__).resolve().parent
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+ROOT_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 LOCAL_DEPS_DIR = ROOT_DIR / ".test_deps"
 if LOCAL_DEPS_DIR.exists():
     sys.path.append(str(LOCAL_DEPS_DIR))
@@ -67,9 +68,9 @@ AIRCRAFT_DIRS = {
 }
 
 MODULE_PATHS = {
-    "CFM": ROOT_DIR / "test_cfm" / "pic_code.py",
-    "LEAP": ROOT_DIR / "test_leap" / "pic_5code.py",
-    "PW": ROOT_DIR / "test_pw" / "pic_code.py",
+    "CFM": BUNDLE_DIR / "test_cfm" / "pic_code.py",
+    "LEAP": BUNDLE_DIR / "test_leap" / "pic_5code.py",
+    "PW": BUNDLE_DIR / "test_pw" / "pic_code.py",
 }
 
 QAR_HEADERS = [
@@ -2218,6 +2219,20 @@ def xlsx_workbook_xml():
 """
 
 
+def xlsx_merge_refs(data_rows):
+    refs = ["A1:P1"]
+    start = 0
+    while start < len(data_rows):
+        name = data_rows[start][0] if data_rows[start] else ""
+        end = start
+        while end + 1 < len(data_rows) and data_rows[end + 1] and data_rows[end + 1][0] == name:
+            end += 1
+        if name and end > start:
+            refs.append(f"A{start + 3}:A{end + 3}")
+        start = end + 1
+    return refs
+
+
 def xlsx_sheet_xml(data_rows):
     columns_xml = "".join(
         f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
@@ -2228,8 +2243,13 @@ def xlsx_sheet_xml(data_rows):
         xlsx_row_xml(2, QAR_HEADERS, style_id=2),
     ]
     for offset, data_row in enumerate(data_rows, start=3):
-        rows_xml.append(xlsx_row_xml(offset, data_row, style_id=0))
+        display_row = list(data_row)
+        if offset > 3 and data_row and data_rows[offset - 4] and data_row[0] == data_rows[offset - 4][0]:
+            display_row[0] = ""
+        rows_xml.append(xlsx_row_xml(offset, display_row, style_id=0))
     dimension = f"A1:{xlsx_cell_ref(max(len(data_rows) + 2, 2), len(QAR_HEADERS) - 1)}"
+    merge_refs = xlsx_merge_refs(data_rows)
+    merge_xml = "".join(f'<mergeCell ref="{ref}"/>' for ref in merge_refs)
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
@@ -2238,7 +2258,7 @@ def xlsx_sheet_xml(data_rows):
   <sheetFormatPr defaultRowHeight="15"/>
   <cols>{columns_xml}</cols>
   <sheetData>{"".join(rows_xml)}</sheetData>
-  <mergeCells count="1"><mergeCell ref="A1:P1"/></mergeCells>
+  <mergeCells count="{len(merge_refs)}">{merge_xml}</mergeCells>
 </worksheet>
 """
 
