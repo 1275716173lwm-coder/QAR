@@ -299,17 +299,11 @@ def row_delta_seconds(rows, start_row, end_row, time_header, headers=None):
     if start_row is None or end_row is None:
         return None
     headers = headers or header_index_map(rows)
-    start_time = cell_datetime_by_header(rows, start_row, time_header, headers=headers)
-    end_time = cell_datetime_by_header(rows, end_row, time_header, headers=headers)
-    if start_time is not None and end_time is not None:
-        seconds = abs(int(round((end_time - start_time).total_seconds())))
-        if seconds != 0 or start_row == end_row:
-            return seconds
     start_index = cell_float_by_header(rows, start_row, "line_index", headers=headers)
     end_index = cell_float_by_header(rows, end_row, "line_index", headers=headers)
     if start_index is not None and end_index is not None:
         return abs(int(round(end_index - start_index)))
-    return None
+    return abs(int(end_row - start_row))
 
 
 def numeric_cell_at(rows, row_index, column_index):
@@ -611,7 +605,7 @@ def analyze_data_file(item):
         ap_control = f"{format_metric(roll_max)}/{format_metric(pitch_max)}"
     ap_over_10_count = count_abs_greater_than(rows, ap_row, landing_row, config["ap_detect_headers"], headers=headers)
     push_pull_count = push_pull_transition_count(rows, hundred_row, landing_row, config["ap_pitch_headers"], headers=headers)
-    has_push_pull = "是" if push_pull_count >= 10 else "否"
+    has_push_pull = "是" if push_pull_count >= 13 else "否"
     throttle_height = find_throttle_retard_height(
         rows,
         hundred_row,
