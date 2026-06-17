@@ -81,3 +81,157 @@
             
         所有的数值四舍五入取整处理。
         分析的五项大标题字体加粗，且添加word文档中的项目符号，颜色蓝色；杆量大于10个单位或者侧风大于10节时，该段话字体改为红色，如“最大侧风12节”就改为红色字体
+    
+
+    数据分析功能：
+
+        在上述docx文档生成后再生成一个空白的xlsx表格以供下面的数据分析录入，命名为qar.xlsx
+        具体表格形式参考blank.xls，生成一次后记录在程序中，下一次就直接调用即可，不再去寻找blank.xls
+
+        同上，在name1这些姓名文件夹中会有除上述cfm、leap、pw文件夹之外还有命名规则类似于“B-6382_20260519040339___S1_E1_YZDCFM_CA2641.csv”的文件，每个人会有0至3个这种文件，YZDCFM代表该人CFM飞机的数据，20260519040339只判断前半部分读取其日期为2026.5.19，航段为CA2641。同理推广至LEAP和PW飞机的数据。需要做的就是将这些数据以及下面描述的特征数据按照人员和机型的不同录入到qar.xlsx。
+
+        表格中：
+            按列说明
+                1. 时间就是上段中读取到的时间
+                2. 航段就是上段中读取到的航段
+                3. 机型先保持空白
+                4. 接地姿态
+
+                    4.1 对于CFM机型，接地时刻可以判断为：
+                        打开CFM飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为负值时的行数并记录为X行（此时也就是飞机接地时刻数据行），读取该行 `Pitch attitude CA_1` 字段数值即为接地姿态，得到后写入到qar.xlsx中对应人员和机型的接地姿态一栏
+
+                    4.2 对于LEAP机型，接地时刻可以判断为：
+                        打开LEAP飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为负值时的行数并记录为Y行，读取该行 `DISPLAYED PITCH ANGLE CAPT_793` 字段数值即为接地姿态，得到后写入到qar.xlsx中对应人员和机型的接地姿态一栏
+
+                    4.3 对于PW机型，接地时刻可以判断为：
+                        打开PW飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为负值时的行数并记录为Z行，读取该行 `DISPLAYED PITCH ANGLE CAPT_793` 字段数值即为接地姿态，得到后写入到qar.xlsx中对应人员和机型的接地姿态一栏
+
+                    这里得到的X、Y、Z数据后面还会使用，进行记录。这里和后面得到的行数都是满足条件时所在的行号，不需要区间行数。
+
+
+                5. 接地下降率
+
+                    调用4.1、4.2、4.3中得到的X、Y、Z值数据，也就是接地时那一行的数据
+                    5.1 对于CFM机型：读取该行 `Inertial Vertical spd CA` 字段数据即是接地下降率
+                    5.2 对于LEAP机型：读取该行 `INERTIAL VERTICAL SPEED CAPT` 字段数据即是接地下降率
+                    5.3 对于PW机型：读取该行 `INERTIAL VERTICAL SPEED` 字段数据即是接地下降率
+
+                6. 落地最大载荷
+
+                    6.1 对于CFM机型：
+                        找到X行的 `Normal acceleration_1` 到 `Normal acceleration_8` 字段得到一个区域，扩展区域至这些字段对应数据的上下10行，计算这些数据的最大值即为落地最大载荷
+                    6.2 对于LEAP机型:
+                        找到Y行的 `NORMAL ACCELERATION SYS. 1_9` 到 `NORMAL ACCELERATION SYS. 1_233` 字段得到一个区域，扩展区域至这些字段对应数据的上下10行，计算这些数据的最大值即为落地最大载荷
+                    6.3 对于PW机型：
+                        找到Z行的 `NORMAL ACCELERATION SYS. 1_9` 到 `NORMAL ACCELERATION SYS. 1_233` 字段得到一个区域，扩展区域至这些字段对应数据的上下10行，计算这些数据的最大值即为落地最大载荷
+                7. 坡度
+
+                    7.1 对于CFM机型：
+                        找到X行的 `Roll attitude CA_1` 到 `Roll attitude CA_4` 字段，计算这些字段值绝对值的最大值，得到的数值保留原来的正负值进行录入
+
+                    7.1 对于LEAP机型：
+                        找到Y行的 `DISPLAYED ROLL ANGLE CAPT_835` 到 `DISPLAYED ROLL ANGLE CAPT_838` 字段，计算这些字段值绝对值的最大值，得到的数值保留原来的正负值进行录入
+
+                    7.1 对于PW机型：
+                        找到Z行的 `DISPLAYED ROLL ANGLE CAPT_835` 到 `DISPLAYED ROLL ANGLE CAPT_838` 字段，计算这些字段值绝对值的最大值，得到的数值保留原来的正负值进行录入
+
+                8. 50英尺到接地时间：
+
+                    8.1 对于CFM机型：
+                        打开CFM飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为最接近50时的行数并记录为X1行（此时也就是飞机50ft时刻），读取X1行和X行的 `time` 字段，计算两个时间的差值绝对值，结果以秒写入；若 `time` 字段只精确到分钟导致差值为0，则使用 `line_index` 字段差值作为秒数，这个值就是50英尺到接地时间
+
+                    8.2 对于LEAP机型：
+                        打开LEAP飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为最接近50时的行数并记录为Y1行（此时也就是飞机50ft时刻），读取Y1行和Y行的 `time` 字段，计算两个时间的差值绝对值，结果以秒写入；若 `time` 字段只精确到分钟导致差值为0，则使用 `line_index` 字段差值作为秒数，这个值就是50英尺到接地时间
+
+                    8.3 对于PW机型：
+                        打开PW飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为最接近50时的行数并记录为Z1行（此时也就是飞机50ft时刻），读取Z1行和Z行的 `time` 字段，计算两个时间的差值绝对值，结果以秒写入；若 `time` 字段只精确到分钟导致差值为0，则使用 `line_index` 字段差值作为秒数，这个值就是50英尺到接地时间
+
+                9. 断开AP后最大操纵量
+
+                    9.1 对于CFM飞机：
+                        断开AP时间判断：打开CFM飞机的数据表格，参考D列，找到数据第一次从3000以上下降至第一次 `Capt Roll Command Positio_1` 到 `Capt Pitch Command Positi_8` 字段出现非0数据时，记录为X2行（此时也就是飞机断开AP时刻），从X2行到X行的 `Capt Roll Command Positio_1` 到 `Capt Roll Command Positio_8` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为rollmax1；从X2行到X行的 `Capt Pitch Command Positi_1` 到 `Capt Pitch Command Positi_8` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为pitchmax1，在需要录入的单元格中录入rollmax1/pitchmax1，
+                        如：-3.3/4.3
+                        
+
+                    9.2 对于LEAP飞机：
+                        断开AP时间判断：打开LEAP飞机的数据表格，参考D列，找到数据第一次从3000以上下降至第一次 `ROLL CAPT CMD POSITION_46` 到 `PITCH CAPT CMD POSITION_954` 字段出现非0数据时，记录为Y2行（此时也就是飞机断开AP时刻），从Y2行到Y行的 `ROLL CAPT CMD POSITION_46` 到 `ROLL CAPT CMD POSITION_942` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为rollmax2；从Y2行到Y行的 `PITCH CAPT CMD POSITION_58` 到 `PITCH CAPT CMD POSITION_954` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为pitchmax2，在需要录入的单元格中录入rollmax2/pitchmax2，
+                        如：-3.3/4.3
+
+                    9.3 对于PW飞机：
+                        断开AP时间判断：打开PW飞机的数据表格，参考D列，找到数据第一次从3000以上下降至第一次 `ROLL CAPT CMD POSITION_46` 到 `PITCH CAPT CMD POSITION_954` 字段出现非0数据时，记录为Z2行（此时也就是飞机断开AP时刻），从Z2行到Z行的 `ROLL CAPT CMD POSITION_46` 到 `ROLL CAPT CMD POSITION_942` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为rollmax3；从Z2行到Z行的 `PITCH CAPT CMD POSITION_58` 到 `PITCH CAPT CMD POSITION_954` 字段中计算所有数据绝对值的最大值，得到后保留原始数据（即保留正负）为pitchmax3，在需要录入的单元格中录入rollmax3/pitchmax3，
+                        如：-3.3/4.3
+
+                10. 断开AP后操纵量超过10个单位的次数
+
+                    10.1 对于CFM飞机：
+                        从X2行至X行的 `Capt Roll Command Positio_1` 到 `Capt Pitch Command Positi_8` 字段形成的区域内，计算所有数据绝对值大于10的次数，并将其录入
+
+                    10.2 对于LEAP飞机：
+                        从Y2行到Y行的 `ROLL CAPT CMD POSITION_46` 到 `PITCH CAPT CMD POSITION_954` 字段形成的区域内，计算所有数据绝对值大于10的次数，并将其录入
+
+                    10.3 对于PW飞机：
+                        从Z2行到Z行的 `ROLL CAPT CMD POSITION_46` 到 `PITCH CAPT CMD POSITION_954` 字段形成的区域内，计算所有数据绝对值大于10的次数，并将其录入
+                
+                11. 100ft后是否推拉杆
+
+                    100ft以下时间判断：
+                        对于CFM, LEAP, PW飞机的数据表格，参考D列，找到数据第一次从2000以上下降至第一次变为最接近100时的行数并分别记录为X3,Y3,Z3行（此时也就是飞机100ft时刻）
+
+                    11.1 对于CFM飞机：
+                        从X3行到X行的`Capt Pitch Command Positi_1` 到`Capt Pitch Command Positi_8` 字段中，从左至右，从上至下依次读取数据，如果出现10次或以上的数据由负值变正值再变为负值的情况，则判断为存在推拉杆，写入表格“是”，若没有，则写入“否”
+                    
+                    11.2 对于LEAP飞机：
+                        从Y3行到Y行的`PITCH CAPT CMD POSITION_58` 到 `PITCH CAPT CMD POSITION_954` 字段中，从左至右，从上至下依次读取数据，如果出现10次或以上的数据由负值变正值再变为负值的情况，则判断为存在推拉杆，写入表格“是”，若没有，则写入“否”
+
+                    11.3 对于PW飞机：
+                        从Z3行到Z行的`PITCH CAPT CMD POSITION_58` 到 `PITCH CAPT CMD POSITION_954` 字段中，从左至右，从上至下依次读取数据，如果出现10次或以上的数据由负值变正值再变为负值的情况，则判断为存在推拉杆，写入表格“是”，若没有，则写入“否”    
+                
+                12 收油门高度
+                    12.1 对于CFM飞机： 
+
+                        在X3行至X行的`Throttle lever angle Eng1_1`至`Throttle lever angle Eng2_2`字段中：
+                        按行进行分析
+                            当：
+                                `Throttle lever angle Eng1_1`和`Throttle lever angle Eng1_2`字段中至少有一个数值小于1且`Throttle lever angle Eng2_1`和`Throttle lever angle Eng2_2`字段中至少有一个数值小于1同时满足时
+                            此时的行数记录为X4，读取X4行D列高度值作为收油门高度，录入时添加单位`ft`
+
+                    12.2 对于LEAP飞机：
+
+                        在Y3行至Y行的` THRUST LEVER ANGLE POS SYS. 1`至` THRUST LEVER ANGLE POS SYS. 2`字段中：
+                        按行进行分析
+                            当：
+                                ` THRUST LEVER ANGLE POS SYS. 1`和` THRUST LEVER ANGLE POS SYS. 2`字段中每个数值都小于1同时满足时
+                            此时的行数记录为Y4，读取Y4行D列高度值作为收油门高度，录入时添加单位`ft`
+
+                    12.3 对于PW飞机：
+
+                        在Z3行至Z行的`THROTTLE LEVER ANGLE ENG 1 (CFM)_206`至`THROTTLE LEVER ANGLE ENG 2 (CFM)_720`字段中：
+                        按行分析
+                            当：
+                                `THROTTLE LEVER ANGLE ENG 1 (CFM)_206`和`THROTTLE LEVER ANGLE ENG 1 (CFM)_718`字段中至少有一个数值小于1且`THROTTLE LEVER ANGLE ENG 2 (CFM)_208`和`THROTTLE LEVER ANGLE ENG 2 (CFM)_720`字段中至少有一个数值小于1同时满足时
+                            此时的行数记录为Z4，读取Z4行D列高度值作为收油门高度，录入时添加单位`ft`
+
+                    
+                13 起飞离地姿态
+
+                    13.1 对于 CFM 机型：
+
+                        打开 CFM 飞机的数据表格，自上而下扫描数据行，参考 D 列至 J 列以及 K 列至 Q 列：
+                            当同一行中，D-J 列至少有 3 个值大于1，且 K-Q 列至少有 3 个值大于1时，将首次满足该条件的行记录为起飞离地时刻所在行，为X5行。
+                            这里记录的是满足条件时所在的行号，不需要区间行数
+                        此时按照触发离地条件的高度采样序号，读取X5行对应的 R列 字段数值，记录为起飞离地姿态。
+
+                    13.2  对于 LEAP 机型：
+
+                        打开 LEAP 飞机的数据表格，自上而下扫描数据行，参考 D 列至 H 列以及 I 列至 M 列：
+                            当同一行中，D-H 列至少有 2 个值大于1，且 I-M 列至少有 2 个值大于1时，将首次满足该条件的行记录为起飞离地时刻所在行，为Y5行。
+                            这里记录的是满足条件时所在的行号，不需要区间行数
+                        此时按照触发离地条件的高度采样序号，读取Y5行对应的 N列 字段数值，记录为起飞离地姿态
+                    13.3 对于 PW 机型：
+
+                        打开 PW 飞机的数据表格，自上而下扫描数据行，参考 D 列至 H 列以及 I 列至 M 列：
+                            当同一行中，D-H 列至少有 2 个值大于1，且 I-M 列至少有 2 个值大于1，将首次满足该条件的行记录为起飞离地时刻所在行，为Z5行。
+                            这里记录的是满足条件时所在的行号，不需要区间行数
+                        此时按照触发离地条件的高度采样序号，读取Z5行对应的 N列字段数值，记录为起飞离地姿态
+
+

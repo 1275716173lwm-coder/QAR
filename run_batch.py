@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 import importlib.util
 from pathlib import Path
 import queue
+import re
 import shutil
 import struct
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -16,11 +18,16 @@ from xml.sax.saxutils import escape
 
 import numpy as np
 
-from qar_common import numeric_array, numeric_columns, read_qar_csv
+from qar_common import CSV_ENCODINGS, numeric_array, numeric_columns, read_qar_csv
 
 ROOT_DIR = Path(__file__).resolve().parent
+LOCAL_DEPS_DIR = ROOT_DIR / ".test_deps"
+if LOCAL_DEPS_DIR.exists():
+    sys.path.append(str(LOCAL_DEPS_DIR))
+
 PICS_DIR = ROOT_DIR / "pics"
 REPORT_BASENAME = "QAR分析"
+QAR_XLSX_PATH = ROOT_DIR / "qar.xlsx"
 AIRCRAFT_ORDER = ("CFM", "LEAP", "PW")
 AIRCRAFT_DISPLAY = {
     "CFM": "CFM",
@@ -37,6 +44,15 @@ class AnalysisTask:
     output_path: Path
 
 
+@dataclass
+class DataAnalysisFile:
+    person: str
+    aircraft: str
+    path: Path
+    date_text: str
+    flight_segment: str
+
+
 AIRCRAFT_DIRS = {
     "cfm": "CFM",
     "leap": "LEAP",
@@ -47,6 +63,83 @@ MODULE_PATHS = {
     "CFM": ROOT_DIR / "test_cfm" / "pic_code.py",
     "LEAP": ROOT_DIR / "test_leap" / "pic_5code.py",
     "PW": ROOT_DIR / "test_pw" / "pic_code.py",
+}
+
+QAR_HEADERS = [
+    "姓名",
+    "时间",
+    "航段",
+    "机型",
+    "接地姿态",
+    "接地下降率(ft/min)",
+    "落地最大载荷",
+    "坡度（左为负）",
+    "50英尺到接地时间",
+    "断开AP后最大操纵量（横侧(左为负)，俯仰（拉杆为负））",
+    "断开AP后操纵量超过10个单位的次数",
+    "100ft后是否推拉杆",
+    "收油门高度",
+    "起飞离地姿态",
+    "自定义",
+    "技术建议",
+]
+
+QAR_COLUMN_WIDTHS = [7.5, 13.88, 17.63, 14.63, 10.5, 10.25, 11.75, 8.63, 14.75, 18.38, 17, 16.25, 10.5, 14, 20.5, 16.63]
+
+DATA_FILE_RE = re.compile(r"^.+?_(\d{14})___.*?_YZD(CFM|LEAP|PW)_([^_]+?)(?:\s*\(\d+\))?\.csv$", re.IGNORECASE)
+
+AIRCRAFT_METRIC_CONFIG = {
+    "CFM": {
+        "attitude_header": "Pitch attitude CA_1",
+        "descent_header": "Inertial Vertical spd CA",
+        "load_headers": [f"Normal acceleration_{index}" for index in range(1, 9)],
+        "slope_headers": [f"Roll attitude CA_{index}" for index in range(1, 5)],
+        "time_header": "time",
+        "ap_detect_headers": [f"Capt Roll Command Positio_{index}" for index in range(1, 9)]
+        + [f"Capt Pitch Command Positi_{index}" for index in range(1, 9)],
+        "ap_roll_headers": [f"Capt Roll Command Positio_{index}" for index in range(1, 9)],
+        "ap_pitch_headers": [f"Capt Pitch Command Positi_{index}" for index in range(1, 9)],
+        "throttle_groups": [
+            ["Throttle lever angle Eng1_1", "Throttle lever angle Eng1_2"],
+            ["Throttle lever angle Eng2_1", "Throttle lever angle Eng2_2"],
+        ],
+        "throttle_mode": "any_each_group_below_one",
+        "takeoff_groups": [("D", "J", 3, 1), ("K", "Q", 3, 1)],
+        "takeoff_attitude_column": "R",
+    },
+    "LEAP": {
+        "attitude_header": "DISPLAYED PITCH ANGLE CAPT_793",
+        "descent_header": "INERTIAL VERTICAL SPEED CAPT",
+        "load_headers": [f"NORMAL ACCELERATION SYS. 1_{suffix}" for suffix in (9, 41, 73, 105, 137, 169, 201, 233)],
+        "slope_headers": [f"DISPLAYED ROLL ANGLE CAPT_{suffix}" for suffix in (835, 836, 837, 838)],
+        "time_header": "time",
+        "ap_detect_headers": [f"ROLL CAPT CMD POSITION_{suffix}" for suffix in (46, 174, 302, 430, 558, 686, 814, 942)]
+        + [f"PITCH CAPT CMD POSITION_{suffix}" for suffix in (58, 186, 314, 442, 570, 698, 826, 954)],
+        "ap_roll_headers": [f"ROLL CAPT CMD POSITION_{suffix}" for suffix in (46, 174, 302, 430, 558, 686, 814, 942)],
+        "ap_pitch_headers": [f"PITCH CAPT CMD POSITION_{suffix}" for suffix in (58, 186, 314, 442, 570, 698, 826, 954)],
+        "throttle_groups": [["THRUST LEVER ANGLE POS SYS. 1", "THRUST LEVER ANGLE POS SYS. 2"]],
+        "throttle_mode": "all_below_one",
+        "takeoff_groups": [("D", "H", 2, 1), ("I", "M", 2, 1)],
+        "takeoff_attitude_column": "N",
+    },
+    "PW": {
+        "attitude_header": "DISPLAYED PITCH ANGLE CAPT_793",
+        "descent_header": "INERTIAL VERTICAL SPEED",
+        "load_headers": [f"NORMAL ACCELERATION SYS. 1_{suffix}" for suffix in (9, 41, 73, 105, 137, 169, 201, 233)],
+        "slope_headers": [f"DISPLAYED ROLL ANGLE CAPT_{suffix}" for suffix in (835, 836, 837, 838)],
+        "time_header": "time",
+        "ap_detect_headers": [f"ROLL CAPT CMD POSITION_{suffix}" for suffix in (46, 174, 302, 430, 558, 686, 814, 942)]
+        + [f"PITCH CAPT CMD POSITION_{suffix}" for suffix in (58, 186, 314, 442, 570, 698, 826, 954)],
+        "ap_roll_headers": [f"ROLL CAPT CMD POSITION_{suffix}" for suffix in (46, 174, 302, 430, 558, 686, 814, 942)],
+        "ap_pitch_headers": [f"PITCH CAPT CMD POSITION_{suffix}" for suffix in (58, 186, 314, 442, 570, 698, 826, 954)],
+        "throttle_groups": [
+            ["THROTTLE LEVER ANGLE ENG 1 (CFM)_206", "THROTTLE LEVER ANGLE ENG 1 (CFM)_718"],
+            ["THROTTLE LEVER ANGLE ENG 2 (CFM)_208", "THROTTLE LEVER ANGLE ENG 2 (CFM)_720"],
+        ],
+        "throttle_mode": "any_each_group_below_one",
+        "takeoff_groups": [("D", "H", 2, 1), ("I", "M", 2, 1)],
+        "takeoff_attitude_column": "N",
+    },
 }
 
 
@@ -63,6 +156,483 @@ def classify_csv(path):
     if has_lly:
         return "PW"
     return None
+
+
+def parse_data_analysis_file(person, path):
+    match = DATA_FILE_RE.match(path.name)
+    if not match:
+        return None
+    timestamp, aircraft, flight_segment = match.groups()
+    try:
+        date = datetime.strptime(timestamp[:8], "%Y%m%d")
+        date_text = f"{date.year}.{date.month}.{date.day}"
+    except ValueError:
+        date_text = timestamp[:8]
+    return DataAnalysisFile(
+        person=person,
+        aircraft=aircraft.upper(),
+        path=path,
+        date_text=date_text,
+        flight_segment=flight_segment,
+    )
+
+
+def scan_data_analysis_files(data_root):
+    files = []
+    for person_dir in sorted((p for p in data_root.iterdir() if p.is_dir()), key=lambda p: p.name.lower()):
+        for path in sorted(person_dir.glob("*.csv"), key=lambda p: p.name.lower()):
+            item = parse_data_analysis_file(person_dir.name, path)
+            if item is not None:
+                files.append(item)
+    return files
+
+
+def read_csv_rows(path):
+    import csv
+
+    for encoding in CSV_ENCODINGS:
+        try:
+            with Path(path).open("r", encoding=encoding, newline="") as handle:
+                return list(csv.reader(handle))
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("csv", b"", 0, 1, f"Unable to decode {path} with supported encodings")
+
+
+def column_to_index(column):
+    value = 0
+    for char in column.upper():
+        if not ("A" <= char <= "Z"):
+            raise ValueError(f"无效列名：{column}")
+        value = value * 26 + ord(char) - ord("A") + 1
+    return value - 1
+
+
+def column_range(start, end):
+    start_index = column_to_index(start)
+    end_index = column_to_index(end)
+    return range(start_index, end_index + 1)
+
+
+def header_index_map(rows):
+    if len(rows) < 2:
+        return {}
+    return {name.strip(): index for index, name in enumerate(rows[1]) if name.strip()}
+
+
+def cell_text(rows, excel_row, column):
+    row_index = excel_row - 1
+    column_index = column_to_index(column)
+    if row_index < 0 or row_index >= len(rows):
+        return ""
+    row = rows[row_index]
+    if column_index >= len(row):
+        return ""
+    return row[column_index].strip()
+
+
+def cell_float(rows, excel_row, column):
+    text = cell_text(rows, excel_row, column)
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def header_cell_text(rows, excel_row, header_name, headers=None):
+    headers = headers or header_index_map(rows)
+    row_index = excel_row - 1
+    column_index = headers.get(header_name)
+    if column_index is None or row_index < 0 or row_index >= len(rows):
+        return ""
+    row = rows[row_index]
+    if column_index >= len(row):
+        return ""
+    return row[column_index].strip()
+
+
+def cell_float_by_header(rows, excel_row, header_name, headers=None):
+    text = header_cell_text(rows, excel_row, header_name, headers=headers)
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def row_values_by_headers(rows, excel_row, header_names, headers=None):
+    headers = headers or header_index_map(rows)
+    values = []
+    for header_name in header_names:
+        value = cell_float_by_header(rows, excel_row, header_name, headers=headers)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def parse_time_text(value):
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def cell_datetime_by_header(rows, excel_row, header_name, headers=None):
+    return parse_time_text(header_cell_text(rows, excel_row, header_name, headers=headers))
+
+
+def row_delta_seconds(rows, start_row, end_row, time_header, headers=None):
+    if start_row is None or end_row is None:
+        return None
+    headers = headers or header_index_map(rows)
+    start_time = cell_datetime_by_header(rows, start_row, time_header, headers=headers)
+    end_time = cell_datetime_by_header(rows, end_row, time_header, headers=headers)
+    if start_time is not None and end_time is not None:
+        seconds = abs(int(round((end_time - start_time).total_seconds())))
+        if seconds != 0 or start_row == end_row:
+            return seconds
+    start_index = cell_float_by_header(rows, start_row, "line_index", headers=headers)
+    end_index = cell_float_by_header(rows, end_row, "line_index", headers=headers)
+    if start_index is not None and end_index is not None:
+        return abs(int(round(end_index - start_index)))
+    return None
+
+
+def numeric_cell_at(rows, row_index, column_index):
+    if row_index < 0 or row_index >= len(rows):
+        return None
+    row = rows[row_index]
+    if column_index >= len(row):
+        return None
+    text = row[column_index].strip()
+    if text == "":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def data_rows_with_d(rows):
+    values = []
+    d_index = column_to_index("D")
+    for row_index in range(3, len(rows)):
+        value = numeric_cell_at(rows, row_index, d_index)
+        if value is not None:
+            values.append((row_index + 1, value))
+    return values
+
+
+def find_first_above_then_negative_row(rows, threshold=2000):
+    d_values = data_rows_with_d(rows)
+    first_above_position = next((index for index, (_, value) in enumerate(d_values) if value > threshold), None)
+    if first_above_position is None:
+        return None
+    for excel_row, value in d_values[first_above_position + 1:]:
+        if value < 0:
+            return excel_row
+    return None
+
+
+def find_closest_height_row(rows, landing_row, threshold=2000, target=50):
+    d_values = data_rows_with_d(rows)
+    if landing_row is None:
+        return None
+
+    landing_position = next((index for index, (row, _) in enumerate(d_values) if row >= landing_row), None)
+    if landing_position is None:
+        return None
+
+    start_position = None
+    for index in range(1, landing_position + 1):
+        previous_value = d_values[index - 1][1]
+        current_value = d_values[index][1]
+        if previous_value > threshold and current_value <= threshold:
+            start_position = index
+    if start_position is None:
+        start_position = next((index for index in range(landing_position, -1, -1) if d_values[index][1] > threshold), None)
+        start_position = 0 if start_position is None else start_position + 1
+
+    candidates = [(row, value) for row, value in d_values[start_position:landing_position + 1] if row <= landing_row]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (abs(item[1] - target), item[0]))[0]
+
+
+def row_has_nonzero(rows, excel_row, start_col, end_col):
+    row_index = excel_row - 1
+    for column_index in column_range(start_col, end_col):
+        value = numeric_cell_at(rows, row_index, column_index)
+        if value is not None and value != 0:
+            return True
+    return False
+
+
+def row_has_nonzero_by_headers(rows, excel_row, header_names, headers=None):
+    headers = headers or header_index_map(rows)
+    return any(value != 0 for value in row_values_by_headers(rows, excel_row, header_names, headers=headers))
+
+
+def find_ap_disconnect_row(rows, start_col, end_col):
+    d_values = data_rows_with_d(rows)
+    first_above_position = next((index for index, (_, value) in enumerate(d_values) if value > 3000), None)
+    if first_above_position is None:
+        return None
+
+    crossing_row = None
+    for index in range(first_above_position + 1, len(d_values)):
+        previous_row, previous_value = d_values[index - 1]
+        current_row, current_value = d_values[index]
+        if previous_value > 3000 and current_value <= 3000:
+            crossing_row = current_row
+            break
+    if crossing_row is None:
+        crossing_row = d_values[first_above_position][0]
+
+    for excel_row, _ in d_values:
+        if excel_row >= crossing_row and row_has_nonzero(rows, excel_row, start_col, end_col):
+            return excel_row
+    return None
+
+
+def find_ap_disconnect_row_by_headers(rows, header_names):
+    headers = header_index_map(rows)
+    d_values = data_rows_with_d(rows)
+    first_above_position = next((index for index, (_, value) in enumerate(d_values) if value > 3000), None)
+    if first_above_position is None:
+        return None
+
+    crossing_row = None
+    for index in range(first_above_position + 1, len(d_values)):
+        previous_value = d_values[index - 1][1]
+        current_row, current_value = d_values[index]
+        if previous_value > 3000 and current_value <= 3000:
+            crossing_row = current_row
+            break
+    if crossing_row is None:
+        crossing_row = d_values[first_above_position][0]
+
+    for excel_row, _ in d_values:
+        if excel_row >= crossing_row and row_has_nonzero_by_headers(rows, excel_row, header_names, headers=headers):
+            return excel_row
+    return None
+
+
+def max_abs_preserve_sign(rows, start_row, end_row, start_col, end_col):
+    if start_row is None or end_row is None:
+        return None
+    low = max(min(start_row, end_row), 1)
+    high = min(max(start_row, end_row), len(rows))
+    best = None
+    for excel_row in range(low, high + 1):
+        row_index = excel_row - 1
+        for column_index in column_range(start_col, end_col):
+            value = numeric_cell_at(rows, row_index, column_index)
+            if value is None:
+                continue
+            if best is None or abs(value) > abs(best):
+                best = value
+    return best
+
+
+def max_abs_preserve_sign_by_headers(rows, start_row, end_row, header_names, headers=None):
+    if start_row is None or end_row is None:
+        return None
+    headers = headers or header_index_map(rows)
+    low = max(min(start_row, end_row), 1)
+    high = min(max(start_row, end_row), len(rows))
+    best = None
+    for excel_row in range(low, high + 1):
+        for value in row_values_by_headers(rows, excel_row, header_names, headers=headers):
+            if best is None or abs(value) > abs(best):
+                best = value
+    return best
+
+
+def max_region_value(rows, center_row, start_col, end_col, expand=10):
+    if center_row is None:
+        return None
+    low = max(center_row - expand, 1)
+    high = min(center_row + expand, len(rows))
+    values = []
+    for excel_row in range(low, high + 1):
+        row_index = excel_row - 1
+        for column_index in column_range(start_col, end_col):
+            value = numeric_cell_at(rows, row_index, column_index)
+            if value is not None:
+                values.append(value)
+    return max(values) if values else None
+
+
+def max_region_value_by_headers(rows, center_row, header_names, expand=10, headers=None):
+    if center_row is None:
+        return None
+    headers = headers or header_index_map(rows)
+    low = max(center_row - expand, 1)
+    high = min(center_row + expand, len(rows))
+    values = []
+    for excel_row in range(low, high + 1):
+        values.extend(row_values_by_headers(rows, excel_row, header_names, headers=headers))
+    return max(values) if values else None
+
+
+def values_in_row_range_by_headers(rows, start_row, end_row, header_names, headers=None):
+    if start_row is None or end_row is None:
+        return []
+    headers = headers or header_index_map(rows)
+    low = max(min(start_row, end_row), 1)
+    high = min(max(start_row, end_row), len(rows))
+    values = []
+    for excel_row in range(low, high + 1):
+        values.extend(row_values_by_headers(rows, excel_row, header_names, headers=headers))
+    return values
+
+
+def count_abs_greater_than(rows, start_row, end_row, header_names, threshold=10, headers=None):
+    return sum(1 for value in values_in_row_range_by_headers(rows, start_row, end_row, header_names, headers=headers) if abs(value) > threshold)
+
+
+def push_pull_transition_count(rows, start_row, end_row, header_names, headers=None):
+    signs = []
+    for value in values_in_row_range_by_headers(rows, start_row, end_row, header_names, headers=headers):
+        if value > 0:
+            sign = 1
+        elif value < 0:
+            sign = -1
+        else:
+            continue
+        if not signs or signs[-1] != sign:
+            signs.append(sign)
+    return sum(1 for index in range(len(signs) - 2) if signs[index:index + 3] == [-1, 1, -1])
+
+
+def d_height_at_row(rows, excel_row):
+    if excel_row is None:
+        return None
+    return cell_float(rows, excel_row, "D")
+
+
+def throttle_condition_met(rows, excel_row, groups, mode, headers=None):
+    headers = headers or header_index_map(rows)
+    group_values = [row_values_by_headers(rows, excel_row, group, headers=headers) for group in groups]
+    if any(not values for values in group_values):
+        return False
+    if mode == "all_below_one":
+        return all(value < 1 for values in group_values for value in values)
+    if mode == "any_each_group_below_one":
+        return all(any(value < 1 for value in values) for values in group_values)
+    return False
+
+
+def find_throttle_retard_height(rows, start_row, end_row, groups, mode, headers=None):
+    if start_row is None or end_row is None:
+        return None
+    low = max(min(start_row, end_row), 1)
+    high = min(max(start_row, end_row), len(rows))
+    for excel_row in range(low, high + 1):
+        if throttle_condition_met(rows, excel_row, groups, mode, headers=headers):
+            return d_height_at_row(rows, excel_row)
+    return None
+
+
+def positive_count_in_column_range(rows, excel_row, start_col, end_col, threshold=0):
+    count = 0
+    row_index = excel_row - 1
+    for column_index in column_range(start_col, end_col):
+        value = numeric_cell_at(rows, row_index, column_index)
+        if value is not None and value > threshold:
+            count += 1
+    return count
+
+
+def find_takeoff_row(rows, takeoff_groups):
+    for excel_row in range(4, len(rows) + 1):
+        matches = []
+        for group in takeoff_groups:
+            start_col, end_col, required, *rest = group
+            threshold = rest[0] if rest else 0
+            matches.append(positive_count_in_column_range(rows, excel_row, start_col, end_col, threshold=threshold) >= required)
+        if all(matches):
+            return excel_row
+    return None
+
+
+def format_metric(value):
+    if value is None:
+        return ""
+    number = float(value)
+    if abs(number - round(number)) < 0.0001:
+        return int(round(number))
+    return round(number, 4)
+
+
+def format_height_ft(value):
+    metric = format_metric(value)
+    if metric == "":
+        return ""
+    return f"{metric}ft"
+
+
+def analyze_data_file(item):
+    rows = read_csv_rows(item.path)
+    config = AIRCRAFT_METRIC_CONFIG[item.aircraft]
+    headers = header_index_map(rows)
+    landing_row = find_first_above_then_negative_row(rows)
+    fifty_row = find_closest_height_row(rows, landing_row)
+    hundred_row = find_closest_height_row(rows, landing_row, target=100)
+    ap_row = find_ap_disconnect_row_by_headers(rows, config["ap_detect_headers"])
+    takeoff_row = find_takeoff_row(rows, config["takeoff_groups"])
+
+    landing_attitude = cell_float_by_header(rows, landing_row, config["attitude_header"], headers=headers) if landing_row else None
+    descent_rate = cell_float_by_header(rows, landing_row, config["descent_header"], headers=headers) if landing_row else None
+    max_load = max_region_value_by_headers(rows, landing_row, config["load_headers"], headers=headers)
+    slope = max_abs_preserve_sign_by_headers(rows, landing_row, landing_row, config["slope_headers"], headers=headers)
+
+    fifty_to_touchdown = row_delta_seconds(rows, fifty_row, landing_row, config["time_header"], headers=headers)
+
+    roll_max = max_abs_preserve_sign_by_headers(rows, ap_row, landing_row, config["ap_roll_headers"], headers=headers)
+    pitch_max = max_abs_preserve_sign_by_headers(rows, ap_row, landing_row, config["ap_pitch_headers"], headers=headers)
+    ap_control = ""
+    if roll_max is not None or pitch_max is not None:
+        ap_control = f"{format_metric(roll_max)}/{format_metric(pitch_max)}"
+    ap_over_10_count = count_abs_greater_than(rows, ap_row, landing_row, config["ap_detect_headers"], headers=headers)
+    push_pull_count = push_pull_transition_count(rows, hundred_row, landing_row, config["ap_pitch_headers"], headers=headers)
+    has_push_pull = "是" if push_pull_count >= 10 else "否"
+    throttle_height = find_throttle_retard_height(
+        rows,
+        hundred_row,
+        landing_row,
+        config["throttle_groups"],
+        config["throttle_mode"],
+        headers=headers,
+    )
+    takeoff_attitude = cell_float(rows, takeoff_row, config["takeoff_attitude_column"]) if takeoff_row else None
+
+    return [
+        item.person,
+        item.date_text,
+        item.flight_segment,
+        "",
+        format_metric(landing_attitude),
+        format_metric(descent_rate),
+        format_metric(max_load),
+        format_metric(slope),
+        format_metric(fifty_to_touchdown),
+        ap_control,
+        ap_over_10_count,
+        has_push_pull,
+        format_height_ft(throttle_height),
+        format_metric(takeoff_attitude),
+        "",
+        "",
+    ]
 
 
 def unique_output_path(person, aircraft):
@@ -1580,6 +2150,163 @@ def generate_report_with_ooxml(successful_tasks, skipped, validation_errors, fai
     return report_path
 
 
+def xlsx_column_letter(index):
+    index += 1
+    letters = []
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        letters.append(chr(ord("A") + remainder))
+    return "".join(reversed(letters))
+
+
+def xlsx_cell_ref(row, column_index):
+    return f"{xlsx_column_letter(column_index)}{row}"
+
+
+def xlsx_cell_xml(row, column_index, value, style_id=None):
+    ref = xlsx_cell_ref(row, column_index)
+    style_attr = f' s="{style_id}"' if style_id is not None else ""
+    if value is None or value == "":
+        return f'<c r="{ref}"{style_attr}/>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    return f'<c r="{ref}" t="inlineStr"{style_attr}><is><t>{escape(str(value))}</t></is></c>'
+
+
+def xlsx_row_xml(row_index, values, style_id=None):
+    cells = [xlsx_cell_xml(row_index, column_index, value, style_id=style_id) for column_index, value in enumerate(values)]
+    return f'<row r="{row_index}">{"".join(cells)}</row>'
+
+
+def xlsx_styles_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="3">
+    <font><sz val="11"/><name val="Microsoft YaHei"/></font>
+    <font><b/><sz val="14"/><name val="Microsoft YaHei"/></font>
+    <font><b/><sz val="11"/><name val="Microsoft YaHei"/></font>
+  </fonts>
+  <fills count="3">
+    <fill><patternFill patternType="none"/></fill>
+    <fill><patternFill patternType="gray125"/></fill>
+    <fill><patternFill patternType="solid"><fgColor rgb="FFD9EAF7"/><bgColor indexed="64"/></patternFill></fill>
+  </fills>
+  <borders count="2">
+    <border><left/><right/><top/><bottom/><diagonal/></border>
+    <border><left style="thin"><color rgb="FFD9D9D9"/></left><right style="thin"><color rgb="FFD9D9D9"/></right><top style="thin"><color rgb="FFD9D9D9"/></top><bottom style="thin"><color rgb="FFD9D9D9"/></bottom><diagonal/></border>
+  </borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="3">
+    <xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1"/>
+    <xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyAlignment="1"><alignment horizontal="center"/></xf>
+    <xf numFmtId="0" fontId="2" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+  </cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+  <dxfs count="0"/>
+  <tableStyles count="0" defaultTableStyle="TableStyleMedium2" defaultPivotStyle="PivotStyleLight16"/>
+</styleSheet>
+"""
+
+
+def xlsx_workbook_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="QAR" sheetId="1" r:id="rId1"/></sheets>
+</workbook>
+"""
+
+
+def xlsx_sheet_xml(data_rows):
+    columns_xml = "".join(
+        f'<col min="{index + 1}" max="{index + 1}" width="{width}" customWidth="1"/>'
+        for index, width in enumerate(QAR_COLUMN_WIDTHS)
+    )
+    rows_xml = [
+        xlsx_row_xml(1, ["飞行部二大队一中队QAR专项监控分析表"], style_id=1),
+        xlsx_row_xml(2, QAR_HEADERS, style_id=2),
+    ]
+    for offset, data_row in enumerate(data_rows, start=3):
+        rows_xml.append(xlsx_row_xml(offset, data_row, style_id=0))
+    dimension = f"A1:{xlsx_cell_ref(max(len(data_rows) + 2, 2), len(QAR_HEADERS) - 1)}"
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+ xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <dimension ref="{dimension}"/>
+  <sheetViews><sheetView workbookViewId="0"><pane ySplit="2" topLeftCell="A3" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>
+  <sheetFormatPr defaultRowHeight="15"/>
+  <cols>{columns_xml}</cols>
+  <sheetData>{"".join(rows_xml)}</sheetData>
+  <mergeCells count="1"><mergeCell ref="A1:P1"/></mergeCells>
+</worksheet>
+"""
+
+
+def xlsx_content_types_xml():
+    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+  <Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>
+"""
+
+
+def generate_qar_xlsx(data_root):
+    data_files = scan_data_analysis_files(data_root)
+    data_rows = []
+    errors = []
+    for item in data_files:
+        try:
+            data_rows.append(analyze_data_file(item))
+        except Exception as exc:
+            errors.append((item.person, item.aircraft, item.path.name, str(exc)))
+
+    output_path = QAR_XLSX_PATH
+    temp_dir = output_path.with_suffix(".xlsx_parts")
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    (temp_dir / "_rels").mkdir(parents=True)
+    (temp_dir / "docProps").mkdir(parents=True)
+    (temp_dir / "xl" / "_rels").mkdir(parents=True)
+    (temp_dir / "xl" / "worksheets").mkdir(parents=True)
+
+    (temp_dir / "[Content_Types].xml").write_text(xlsx_content_types_xml(), encoding="utf-8")
+    (temp_dir / "_rels" / ".rels").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+        '</Relationships>',
+        encoding="utf-8",
+    )
+    (temp_dir / "docProps" / "core.xml").write_text(_core_properties_xml(), encoding="utf-8")
+    (temp_dir / "docProps" / "app.xml").write_text(_app_properties_xml(), encoding="utf-8")
+    (temp_dir / "xl" / "workbook.xml").write_text(xlsx_workbook_xml(), encoding="utf-8")
+    (temp_dir / "xl" / "styles.xml").write_text(xlsx_styles_xml(), encoding="utf-8")
+    (temp_dir / "xl" / "worksheets" / "sheet1.xml").write_text(xlsx_sheet_xml(data_rows), encoding="utf-8")
+    (temp_dir / "xl" / "_rels" / "workbook.xml.rels").write_text(
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '</Relationships>',
+        encoding="utf-8",
+    )
+
+    with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for part in temp_dir.rglob("*"):
+            if part.is_file():
+                archive.write(part, part.relative_to(temp_dir).as_posix())
+    shutil.rmtree(temp_dir)
+    return output_path, len(data_rows), errors
+
+
 class ProgressWindow:
     def __init__(self, root, total):
         self.root = root
@@ -1620,7 +2347,7 @@ class ProgressWindow:
             self.progress_var.set(f"进度：{done} / {self.total}")
 
 
-def worker(tasks, modules, events, skipped, validation_errors):
+def worker(tasks, modules, events, skipped, validation_errors, data_root):
     completed = 0
     failures = []
     successful_tasks = []
@@ -1644,16 +2371,28 @@ def worker(tasks, modules, events, skipped, validation_errors):
 
     report_path = None
     report_error = None
+    xlsx_path = None
+    xlsx_error = None
+    xlsx_count = 0
+    xlsx_errors = []
     if successful_tasks:
-        try:
-            events.put(("status", "汇总报告", "DOCX", "正在生成 DOCX 分析报告", completed))
-            report_path = generate_report(successful_tasks, skipped, validation_errors, failures)
-            events.put(("status", "汇总报告", "DOCX", f"已生成报告：{report_path.name}", completed))
-        except Exception as exc:
-            report_error = (str(exc), traceback.format_exc())
-            events.put(("status", "汇总报告", "DOCX", "DOCX 报告生成失败", completed))
+        # try:
+        #     events.put(("status", "汇总报告", "DOCX", "正在生成 DOCX 分析报告", completed))
+        #     report_path = generate_report(successful_tasks, skipped, validation_errors, failures)
+        #     events.put(("status", "汇总报告", "DOCX", f"已生成报告：{report_path.name}", completed))
+        # except Exception as exc:
+        #     report_error = (str(exc), traceback.format_exc())
+        #     events.put(("status", "汇总报告", "DOCX", "DOCX 报告生成失败", completed))
 
-    events.put(("done", total - len(failures), failures, report_path, report_error))
+        try:
+            events.put(("status", "数据分析", "XLSX", "正在生成 qar.xlsx 数据分析表", completed))
+            xlsx_path, xlsx_count, xlsx_errors = generate_qar_xlsx(data_root)
+            events.put(("status", "数据分析", "XLSX", f"已生成数据表：{xlsx_path.name}", completed))
+        except Exception as exc:
+            xlsx_error = (str(exc), traceback.format_exc())
+            events.put(("status", "数据分析", "XLSX", "qar.xlsx 生成失败", completed))
+
+    events.put(("done", total - len(failures), failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors))
 
 
 def show_initial_errors(errors):
@@ -1665,7 +2404,7 @@ def show_initial_errors(errors):
     messagebox.showwarning("数据校验错误", "\n".join(lines))
 
 
-def run_progress_window(tasks, skipped, validation_errors):
+def run_progress_window(tasks, skipped, validation_errors, data_root):
     root = tk.Tk()
     progress_window = ProgressWindow(root, len(tasks))
     events = queue.Queue()
@@ -1677,7 +2416,7 @@ def run_progress_window(tasks, skipped, validation_errors):
         root.destroy()
         return
 
-    thread = threading.Thread(target=worker, args=(tasks, modules, events, skipped, validation_errors), daemon=True)
+    thread = threading.Thread(target=worker, args=(tasks, modules, events, skipped, validation_errors, data_root), daemon=True)
     thread.start()
 
     def poll_events():
@@ -1688,9 +2427,9 @@ def run_progress_window(tasks, skipped, validation_errors):
                     _, person, aircraft, status, done = event
                     progress_window.update_status(person, aircraft, status, done)
                 elif event[0] == "done":
-                    _, completed, failures, report_path, report_error = event
+                    _, completed, failures, report_path, report_error, xlsx_path, xlsx_error, xlsx_count, xlsx_errors = event
                     progress_window.update_status(status="全部任务处理完成", done=len(tasks))
-                    total_errors = len(validation_errors) + len(failures) + (1 if report_error else 0)
+                    total_errors = len(validation_errors) + len(failures) + len(xlsx_errors) + (1 if report_error else 0) + (1 if xlsx_error else 0)
                     summary = (
                         f"批量分析完成。\n\n"
                         f"成功：{completed}\n"
@@ -1700,11 +2439,18 @@ def run_progress_window(tasks, skipped, validation_errors):
                     )
                     if report_path:
                         summary += f"\n报告文件：{report_path}"
+                    if xlsx_path:
+                        summary += f"\n数据表文件：{xlsx_path}（{xlsx_count} 条）"
                     if failures:
                         first_failure = failures[0]
                         summary += f"\n\n首个分析失败：{first_failure[0]} {first_failure[1]}：{first_failure[2]}"
+                    if xlsx_errors:
+                        first_xlsx_error = xlsx_errors[0]
+                        summary += f"\n\n首个数据表失败：{first_xlsx_error[0]} {first_xlsx_error[1]} {first_xlsx_error[2]}：{first_xlsx_error[3]}"
                     if report_error:
                         summary += f"\n\n报告生成失败：{report_error[0]}"
+                    if xlsx_error:
+                        summary += f"\n\nqar.xlsx 生成失败：{xlsx_error[0]}"
                     messagebox.showinfo("完成", summary)
                     root.destroy()
                     return
@@ -1741,7 +2487,7 @@ def main():
         )
         return
 
-    run_progress_window(tasks, skipped, validation_errors)
+    run_progress_window(tasks, skipped, validation_errors, data_root)
 
 
 if __name__ == "__main__":
