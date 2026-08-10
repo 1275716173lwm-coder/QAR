@@ -1597,9 +1597,6 @@ def configure_report_styles(document):
 def build_report_items(successful_tasks, skipped, validation_errors, failures):
     items = [
         ("title", "QAR批量分析报告"),
-        (
-            "paragraph",
-        ),
     ]
     if skipped or validation_errors or failures:
         items.append(
