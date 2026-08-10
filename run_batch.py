@@ -14,6 +14,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from xml.sax.saxutils import escape
 
 import numpy as np
@@ -52,6 +53,7 @@ class DataAnalysisFile:
     path: Path
     date_text: str
     flight_segment: str
+    registration: str
 
 
 @dataclass
@@ -59,6 +61,7 @@ class RunOptions:
     generate_images: bool = True
     generate_docx: bool = True
     generate_xlsx: bool = True
+    aircraft_mapping_path: Path | None = None
 
 
 AIRCRAFT_DIRS = {
@@ -94,7 +97,7 @@ QAR_HEADERS = [
 
 QAR_COLUMN_WIDTHS = [7.5, 13.88, 17.63, 14.63, 10.5, 10.25, 11.75, 8.63, 14.75, 18.38, 17, 16.25, 10.5, 14, 20.5, 16.63]
 
-DATA_FILE_RE = re.compile(r"^.+?_(\d{14})___.*?_YZD(CFM|LEAP|PW)_([^_]+?)(?:\s*\(\d+\))?\.csv$", re.IGNORECASE)
+DATA_FILE_RE = re.compile(r"^(.+?)_(\d{14})___.*?_YZD(CFM|LEAP|PW)_([^_]+?)(?:\s*\(\d+\))?\.csv$", re.IGNORECASE)
 
 AIRCRAFT_METRIC_CONFIG = {
     "CFM": {
@@ -170,7 +173,7 @@ def parse_data_analysis_file(person, path):
     match = DATA_FILE_RE.match(path.name)
     if not match:
         return None
-    timestamp, aircraft, flight_segment = match.groups()
+    registration, timestamp, aircraft, flight_segment = match.groups()
     try:
         date = datetime.strptime(timestamp[:8], "%Y%m%d")
         date_text = f"{date.year}.{date.month}.{date.day}"
@@ -182,6 +185,7 @@ def parse_data_analysis_file(person, path):
         path=path,
         date_text=date_text,
         flight_segment=flight_segment,
+        registration=registration.strip().upper(),
     )
 
 
@@ -582,7 +586,7 @@ def format_height_ft(value):
     return f"{metric}ft"
 
 
-def analyze_data_file(item):
+def analyze_data_file(item, aircraft_mapping):
     rows = read_csv_rows(item.path)
     config = AIRCRAFT_METRIC_CONFIG[item.aircraft]
     headers = header_index_map(rows)
@@ -621,7 +625,7 @@ def analyze_data_file(item):
         item.person,
         item.date_text,
         item.flight_segment,
-        "",
+        aircraft_mapping.get(item.registration, ""),
         format_metric(landing_attitude),
         format_metric(descent_rate),
         format_metric(max_load),
@@ -1595,7 +1599,6 @@ def build_report_items(successful_tasks, skipped, validation_errors, failures):
         ("title", "QAR批量分析报告"),
         (
             "paragraph",
-            "本报告由批量分析程序自动生成。所有人员和不同机型写入同一个文档，按人员依次汇总 CFM、LEAP、PW 的分析图片与基础文字结论。",
         ),
     ]
     if skipped or validation_errors or failures:
@@ -2277,13 +2280,112 @@ def xlsx_content_types_xml():
 """
 
 
-def generate_qar_xlsx(data_root):
+XLSX_MAIN_NAMESPACE = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+XLSX_REL_NAMESPACE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+XLSX_PACKAGE_REL_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+
+def xlsx_node_text(node):
+    if node is None:
+        return ""
+    return "".join(child.text or "" for child in node.iter() if child.tag == f"{{{XLSX_MAIN_NAMESPACE}}}t")
+
+
+def xlsx_shared_strings(archive):
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+    return [
+        xlsx_node_text(node)
+        for node in root.findall(f"{{{XLSX_MAIN_NAMESPACE}}}si")
+    ]
+
+
+def xlsx_first_sheet_path(archive):
+    workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    sheets = workbook.find(f"{{{XLSX_MAIN_NAMESPACE}}}sheets")
+    if sheets is None or not list(sheets):
+        raise ValueError("机型对照表没有可读取的工作表。")
+
+    relationship_id = list(sheets)[0].get(f"{{{XLSX_REL_NAMESPACE}}}id")
+    relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    target = next(
+        (
+            relationship.get("Target")
+            for relationship in relationships.findall(f"{{{XLSX_PACKAGE_REL_NAMESPACE}}}Relationship")
+            if relationship.get("Id") == relationship_id
+        ),
+        None,
+    )
+    if not target:
+        raise ValueError("机型对照表的第一个工作表路径无效。")
+    return target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+
+
+def xlsx_cell_text(cell, shared_strings):
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        return xlsx_node_text(cell.find(f"{{{XLSX_MAIN_NAMESPACE}}}is")).strip()
+
+    value_node = cell.find(f"{{{XLSX_MAIN_NAMESPACE}}}v")
+    value = value_node.text.strip() if value_node is not None and value_node.text else ""
+    if cell_type == "s" and value:
+        try:
+            return shared_strings[int(value)].strip()
+        except (IndexError, ValueError):
+            return ""
+    return value
+
+
+def xlsx_column_from_cell_ref(cell_ref):
+    match = re.match(r"([A-Za-z]+)", cell_ref or "")
+    return match.group(1).upper() if match else ""
+
+
+def read_aircraft_mapping_xlsx(mapping_path):
+    mapping = {}
+    duplicate_count = 0
+    path = Path(mapping_path)
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings = xlsx_shared_strings(archive)
+            sheet = ElementTree.fromstring(archive.read(xlsx_first_sheet_path(archive)))
+    except (OSError, KeyError, zipfile.BadZipFile, ElementTree.ParseError) as exc:
+        raise ValueError(f"无法读取机型对照表：{path.name}（{exc}）") from exc
+
+    for row in sheet.findall(f".//{{{XLSX_MAIN_NAMESPACE}}}sheetData/{{{XLSX_MAIN_NAMESPACE}}}row"):
+        cells = {}
+        for cell in row.findall(f"{{{XLSX_MAIN_NAMESPACE}}}c"):
+            column = xlsx_column_from_cell_ref(cell.get("r"))
+            if column in {"A", "B"}:
+                cells[column] = xlsx_cell_text(cell, shared_strings)
+
+        registration = cells.get("A", "").strip().upper()
+        aircraft_model = cells.get("B", "").strip()
+        if not registration or not aircraft_model:
+            continue
+        if registration in {"注册号", "飞机注册号", "飞机号"} and aircraft_model == "机型":
+            continue
+        if registration in mapping:
+            duplicate_count += 1
+            continue
+        mapping[registration] = aircraft_model
+
+    return mapping, duplicate_count
+
+def generate_qar_xlsx(data_root, aircraft_mapping):
     data_files = scan_data_analysis_files(data_root)
     data_rows = []
     errors = []
+    filled_aircraft_models = 0
+    unmatched_aircraft_models = 0
     for item in data_files:
+        if aircraft_mapping.get(item.registration):
+            filled_aircraft_models += 1
+        else:
+            unmatched_aircraft_models += 1
         try:
-            data_rows.append(analyze_data_file(item))
+            data_rows.append(analyze_data_file(item, aircraft_mapping))
         except Exception as exc:
             errors.append((item.person, item.aircraft, item.path.name, str(exc)))
 
@@ -2325,7 +2427,10 @@ def generate_qar_xlsx(data_root):
             if part.is_file():
                 archive.write(part, part.relative_to(temp_dir).as_posix())
     shutil.rmtree(temp_dir)
-    return output_path, len(data_rows), errors
+    return output_path, len(data_rows), errors, {
+        "filled_aircraft_models": filled_aircraft_models,
+        "unmatched_aircraft_models": unmatched_aircraft_models,
+    }
 
 
 class ProgressWindow:
@@ -2422,8 +2527,19 @@ def worker(tasks, modules, events, skipped, validation_errors, data_root, option
 
     if options.generate_xlsx:
         try:
+            if options.aircraft_mapping_path is None:
+                raise ValueError("未选择机型对照表。")
+            events.put(("status", "数据分析", "XLSX", "正在读取机型对照表", completed))
+            aircraft_mapping, duplicate_count = read_aircraft_mapping_xlsx(options.aircraft_mapping_path)
             events.put(("status", "数据分析", "XLSX", "正在生成 qar.xlsx 数据分析表", completed))
-            xlsx_path, xlsx_count, xlsx_errors = generate_qar_xlsx(data_root)
+            xlsx_path, xlsx_count, xlsx_errors, mapping_stats = generate_qar_xlsx(data_root, aircraft_mapping)
+            notes.append(
+                f"机型对照：已载入 {len(aircraft_mapping)} 个注册号，"
+                f"已填充 {mapping_stats['filled_aircraft_models']} 条，"
+                f"未匹配 {mapping_stats['unmatched_aircraft_models']} 条。"
+            )
+            if duplicate_count:
+                notes.append(f"机型对照：发现 {duplicate_count} 条重复注册号，已采用首次出现的有效机型。")
             events.put(("status", "数据分析", "XLSX", f"已生成数据表：{xlsx_path.name}", completed))
         except Exception as exc:
             xlsx_error = (str(exc), traceback.format_exc())
@@ -2443,37 +2559,80 @@ def show_initial_errors(errors):
     messagebox.showwarning("数据校验错误", "\n".join(lines))
 
 
-def ask_run_options():
+def ask_start_options():
     dialog = tk.Tk()
-    dialog.title("生成内容选择")
-    dialog.geometry("320x210")
+    dialog.title("QAR 批量分析")
+    dialog.geometry("660x320")
     dialog.resizable(False, False)
 
+    data_path_var = tk.StringVar()
+    mapping_path_var = tk.StringVar()
     generate_images_var = tk.BooleanVar(value=True)
     generate_docx_var = tk.BooleanVar(value=True)
     generate_xlsx_var = tk.BooleanVar(value=True)
-    result = {"options": None}
+    result = {"data_root": None, "options": None}
 
     frame = ttk.Frame(dialog, padding=18)
     frame.pack(fill="both", expand=True)
+    frame.columnconfigure(1, weight=1)
 
-    ttk.Label(frame, text="请选择本次需要生成的内容：").pack(anchor="w", pady=(0, 10))
-    ttk.Checkbutton(frame, text="生成图片", variable=generate_images_var).pack(anchor="w", pady=2)
-    ttk.Checkbutton(frame, text="生成 DOCX 文档", variable=generate_docx_var).pack(anchor="w", pady=2)
-    ttk.Checkbutton(frame, text="生成 qar分析表格", variable=generate_xlsx_var).pack(anchor="w", pady=2)
+    ttk.Label(frame, text="数据文件夹：").grid(row=0, column=0, sticky="w", pady=(0, 10))
+    ttk.Entry(frame, textvariable=data_path_var, state="readonly", width=62).grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(0, 10))
+
+    def choose_data_directory():
+        selected = filedialog.askdirectory(parent=dialog, title="请选择数据文件夹", initialdir=str(ROOT_DIR / "data"))
+        if selected:
+            data_path_var.set(selected)
+
+    ttk.Button(frame, text="选择文件夹", command=choose_data_directory).grid(row=0, column=2, sticky="e", pady=(0, 10))
+
+    ttk.Label(frame, text="机型对照表：").grid(row=1, column=0, sticky="w", pady=(0, 16))
+    ttk.Entry(frame, textvariable=mapping_path_var, state="readonly", width=62).grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(0, 16))
+
+    def choose_mapping_file():
+        selected = filedialog.askopenfilename(
+            parent=dialog,
+            title="请选择机型对照表",
+            filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")],
+        )
+        if selected:
+            mapping_path_var.set(selected)
+
+    ttk.Button(frame, text="选择 XLSX", command=choose_mapping_file).grid(row=1, column=2, sticky="e", pady=(0, 16))
+
+    ttk.Separator(frame).grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+    ttk.Label(frame, text="请选择本次需要生成的内容：").grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 8))
+    ttk.Checkbutton(frame, text="生成图片", variable=generate_images_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+    ttk.Checkbutton(frame, text="生成 DOCX 文档", variable=generate_docx_var).grid(row=5, column=0, columnspan=3, sticky="w", pady=2)
+    ttk.Checkbutton(frame, text="生成 qar分析表格", variable=generate_xlsx_var).grid(row=6, column=0, columnspan=3, sticky="w", pady=2)
 
     button_frame = ttk.Frame(frame)
-    button_frame.pack(fill="x", pady=(18, 0))
+    button_frame.grid(row=7, column=0, columnspan=3, sticky="e", pady=(18, 0))
 
     def on_start():
+        data_path = Path(data_path_var.get()) if data_path_var.get() else None
+        if data_path is None or not data_path.is_dir():
+            messagebox.showwarning("未选择数据文件夹", "请选择有效的数据文件夹。", parent=dialog)
+            return
+
         options = RunOptions(
             generate_images=generate_images_var.get(),
             generate_docx=generate_docx_var.get(),
             generate_xlsx=generate_xlsx_var.get(),
+            aircraft_mapping_path=Path(mapping_path_var.get()) if mapping_path_var.get() else None,
         )
         if not (options.generate_images or options.generate_docx or options.generate_xlsx):
             messagebox.showwarning("未选择生成内容", "请至少选择一项生成内容。", parent=dialog)
             return
+        if options.generate_xlsx:
+            if options.aircraft_mapping_path is None or not options.aircraft_mapping_path.is_file():
+                messagebox.showwarning("未选择机型对照表", "生成 qar分析表格时，请选择有效的机型对照 XLSX 文件。", parent=dialog)
+                return
+            if options.aircraft_mapping_path.suffix.lower() != ".xlsx":
+                messagebox.showwarning("文件类型错误", "机型对照表必须是 .xlsx 文件。", parent=dialog)
+                return
+
+        result["data_root"] = data_path
         result["options"] = options
         dialog.destroy()
 
@@ -2484,8 +2643,7 @@ def ask_run_options():
     ttk.Button(button_frame, text="取消", command=on_cancel).pack(side="right")
     dialog.protocol("WM_DELETE_WINDOW", on_cancel)
     dialog.mainloop()
-    return result["options"]
-
+    return result["data_root"], result["options"]
 
 def run_progress_window(tasks, skipped, validation_errors, data_root, options):
     root = tk.Tk()
@@ -2551,22 +2709,8 @@ def run_progress_window(tasks, skipped, validation_errors, data_root, options):
 
 
 def main():
-    selector = tk.Tk()
-    selector.withdraw()
-    selector.update()
-    selected = filedialog.askdirectory(title="请选择数据文件夹", initialdir=str(ROOT_DIR / "data"))
-    selector.destroy()
-
-    if not selected:
-        return
-
-    data_root = Path(selected)
-    if not data_root.exists() or not data_root.is_dir():
-        messagebox.showerror("路径错误", "选择的数据文件夹不存在。")
-        return
-
-    options = ask_run_options()
-    if options is None:
+    data_root, options = ask_start_options()
+    if data_root is None or options is None:
         return
 
     tasks, skipped, validation_errors = scan_data_root(data_root)
